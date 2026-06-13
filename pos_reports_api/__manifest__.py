@@ -9,7 +9,7 @@
         "pos_customer_ledger", "pos_vendor_bills", "custom_order_api",
         "custom_warehouse",
     ],
-    "data": [],
+    "data": ["security/ir.model.access.csv"],
     "installable": True,
     "application": False,
     "auto_install": False,

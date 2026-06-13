@@ -4,6 +4,12 @@ from odoo import models, fields, api
 class ResPartner(models.Model):
     _inherit = 'res.partner'
 
+    def _get_company_domain(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     @api.model
     def get_pos_suppliers(self, params=None):
         """
@@ -47,10 +53,12 @@ class ResPartner(models.Model):
         purchase_stats = {}
         if supplier_ids:
             # Total purchased amount
+            _cids = self.env.context.get('allowed_company_ids', [])
             po_data = self.env['purchase.order'].read_group(
                 domain=[
                     ('partner_id', 'in', supplier_ids),
                     ('state', 'in', ('purchase', 'done')),
+                    *([('company_id', 'in', _cids)] if _cids else []),
                 ],
                 fields=['partner_id', 'amount_total:sum'],
                 groupby=['partner_id'],
@@ -68,6 +76,7 @@ class ResPartner(models.Model):
                     ('move_type', '=', 'in_invoice'),
                     ('state', '=', 'posted'),
                     ('payment_state', 'in', ('not_paid', 'partial')),
+                    *([('company_id', 'in', _cids)] if _cids else []),
                 ],
                 fields=['partner_id', 'amount_residual:sum'],
                 groupby=['partner_id'],
@@ -86,6 +95,7 @@ class ResPartner(models.Model):
                     ('state', '=', 'posted'),
                     ('payment_state', 'in', ('not_paid', 'partial')),
                     ('invoice_date_due', '<', fields.Date.today()),
+                    *([('company_id', 'in', _cids)] if _cids else []),
                 ],
                 fields=['partner_id', 'amount_residual:sum'],
                 groupby=['partner_id'],
@@ -133,9 +143,11 @@ class ResPartner(models.Model):
         if not partner.exists() or partner.supplier_rank <= 0:
             return {'success': False, 'message': 'Supplier not found'}
 
+        _cids = self.env.context.get('allowed_company_ids', [])
         # Purchase Orders
         pos = self.env['purchase.order'].search([
             ('partner_id', '=', partner.id),
+            *([('company_id', 'in', _cids)] if _cids else []),
         ], order='date_order desc')
         po_list = [{
             'id': po.id,
@@ -150,6 +162,7 @@ class ResPartner(models.Model):
         bills = self.env['account.move'].search([
             ('partner_id', '=', partner.id),
             ('move_type', '=', 'in_invoice'),
+            *([('company_id', 'in', _cids)] if _cids else []),
         ], order='invoice_date desc')
         bill_list = [{
             'id': b.id,

@@ -10,7 +10,7 @@
         'account_invoice_supplier_ref_unique',
         'account_invoice_supplierinfo_update',
     ],
-    'data': [],
+    'data': ['security/ir.model.access.csv'],
     'installable': True,
     'application': False,
     'auto_install': False,

@@ -4,6 +4,12 @@ from odoo import models, fields, api
 class StockMoveLine(models.Model):
     _inherit = 'stock.move.line'
 
+    def _get_company_domain(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     @api.model
     def get_frontend_ledger(self, params=None):
         if params is None:
@@ -23,7 +29,7 @@ class StockMoveLine(models.Model):
         date_to = params.get('dateTo', '')
 
         # Base Domain: Always ensure the operation is validated and done
-        domain = [('state', '=', 'done')]
+        domain = [('state', '=', 'done'), *self._get_company_domain()]
 
         # 2. Dynamic Filtering
         # A) Date Filters

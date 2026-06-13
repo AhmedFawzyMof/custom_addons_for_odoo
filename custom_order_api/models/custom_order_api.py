@@ -7,6 +7,12 @@ class CustomOrderApi(models.AbstractModel):
     _name = 'custom.order.api'
     _description = 'Headless Order API Handler'
 
+    def _get_company_domain(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     # -------------------------------------------------------------------------
     # 1. GET /api/orders -> api_get_orders
     # -------------------------------------------------------------------------
@@ -37,7 +43,7 @@ class CustomOrderApi(models.AbstractModel):
             'invoiced':  'invoiced',
         }
 
-        domain = []
+        domain = self._get_company_domain()
 
         if status and status.lower() not in ('all', ''):
             odoo_state = STATUS_MAP.get(status.lower(), status)
@@ -98,6 +104,9 @@ class CustomOrderApi(models.AbstractModel):
         order = self.env['pos.order'].browse(int(order_id))
         if not order.exists():
             raise UserError(_("Order not found."))
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids and order.company_id.id not in cids:
+            raise UserError(_("Order not found in this company."))
 
         # Debug: التحقق من المدفوعات
         payment_ids_db = order.payment_ids.ids
@@ -176,6 +185,9 @@ class CustomOrderApi(models.AbstractModel):
 
             if not order.exists():
                 return {'status': 'error', 'message': 'Order not found'}
+            cids = self.env.context.get('allowed_company_ids', [])
+            if cids and order.company_id.id not in cids:
+                return {'status': 'error', 'message': 'Order not found in this company'}
             if not line.exists() or line.order_id.id != order.id:
                 return {'status': 'error', 'message': 'Line not found or does not belong to this order'}
 
@@ -235,6 +247,9 @@ class CustomOrderApi(models.AbstractModel):
         order = self.env['pos.order'].browse(int(order_id))
         if not order.exists():
             return {'status': 'error', 'message': 'Order not found.'}
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids and order.company_id.id not in cids:
+            return {'status': 'error', 'message': 'Order not found in this company'}
 
         # 2. جلب مصفوفة المدفوعات المرسلة من الجافا سكريبت
         payments_list = kwargs.get('payments', [])
@@ -357,6 +372,9 @@ class CustomOrderApi(models.AbstractModel):
             order = self.env['pos.order'].browse(int(order_id))
             if not order.exists():
                 return {'status': 'error', 'message': 'Order not found'}
+            cids = self.env.context.get('allowed_company_ids', [])
+            if cids and order.company_id.id not in cids:
+                return {'status': 'error', 'message': 'Order not found in this company'}
 
             # إنشاء الدفعة
             payment_vals = {
@@ -390,6 +408,9 @@ class CustomOrderApi(models.AbstractModel):
         order = self.env['pos.order'].browse(int(order_id))
         if not order.exists():
             raise UserError(_("Order not found."))
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids and order.company_id.id not in cids:
+            raise UserError(_("Order not found in this company."))
 
         # تنظيف وتجهيز الحالة المرسلة
         cleaned_status = str(new_status).strip().lower()

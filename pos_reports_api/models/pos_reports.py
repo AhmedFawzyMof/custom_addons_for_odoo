@@ -8,6 +8,10 @@ class PosReportsApi(models.Model):
     _description = 'POS Reports API'
     _auto = False
 
+    def _get_allowed_companies(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        return list(cids) if cids else list(self.env.user.company_ids.ids)
+
     def _parse_date(self, value, fallback):
         if not value:
             return fallback
@@ -40,6 +44,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_profit_loss(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -49,7 +54,8 @@ class PosReportsApi(models.Model):
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
-        """, (dt_from, dt_to))
+              AND po.company_id IN %s
+        """, (dt_from, dt_to, tuple(_cids)))
         pos_revenue = float(cr.fetchone()[0])
 
         # Revenue from Sales Orders
@@ -58,7 +64,8 @@ class PosReportsApi(models.Model):
             FROM sale_order so
             WHERE so.state IN ('sale', 'done')
               AND so.date_order >= %s AND so.date_order <= %s
-        """, (dt_from, dt_to))
+              AND so.company_id IN %s
+        """, (dt_from, dt_to, tuple(_cids)))
         so_revenue = float(cr.fetchone()[0])
         total_revenue = pos_revenue + so_revenue
 
@@ -70,9 +77,10 @@ class PosReportsApi(models.Model):
             WHERE aml.date >= %s AND aml.date <= %s
               AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
               AND aml.parent_state = 'posted'
+              AND aml.company_id IN %s
             GROUP BY aa.name
             ORDER BY amount DESC
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         expense_rows = cr.fetchall()
         total_expenses = sum(r[1] for r in expense_rows) or 0.0
 
@@ -85,7 +93,8 @@ class PosReportsApi(models.Model):
                 JOIN stock_move sm ON sm.id = svl.stock_move_id
                 WHERE sm.date >= %s AND sm.date <= %s
                   AND svl.description LIKE '%%[POS]%%'
-            """, (d_from, d_to))
+                  AND sm.company_id IN %s
+            """, (d_from, d_to, tuple(_cids)))
             cogs = float(cr.fetchone()[0])
 
         gross_profit = total_revenue - cogs
@@ -104,8 +113,9 @@ class PosReportsApi(models.Model):
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY month ORDER BY month
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         monthly_revenue = dict(cr.fetchall())
 
         cr.execute("""
@@ -115,8 +125,9 @@ class PosReportsApi(models.Model):
             WHERE aml.date >= %s AND aml.date <= %s
               AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
               AND aml.parent_state = 'posted'
+              AND aml.company_id IN %s
             GROUP BY TO_CHAR(aml.date, 'YYYY-MM') ORDER BY 1
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         monthly_expenses = dict(cr.fetchall())
 
         all_months = sorted(set(list(monthly_revenue.keys()) + list(monthly_expenses.keys())))
@@ -149,6 +160,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_purchases_sales(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -157,8 +169,9 @@ class PosReportsApi(models.Model):
             FROM purchase_order po
             WHERE po.state IN ('purchase', 'done')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY 1 ORDER BY 1
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         monthly_purchases = dict(cr.fetchall())
 
         cr.execute("""
@@ -166,8 +179,9 @@ class PosReportsApi(models.Model):
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY 1 ORDER BY 1
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         monthly_sales = dict(cr.fetchall())
 
         total_purchases = sum(monthly_purchases.values())
@@ -206,6 +220,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_tax(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -217,8 +232,9 @@ class PosReportsApi(models.Model):
             JOIN account_tax at ON at.id = rel.account_tax_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY at.id, at.name ORDER BY 3 DESC
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         tax_rows = cr.fetchall()
 
         tax_ids = [r[0] for r in tax_rows]
@@ -255,17 +271,22 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_suppliers_customers(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
         cr.execute("""
-            SELECT COUNT(*) FROM res_partner WHERE supplier_rank > 0
-        """)
+            SELECT COUNT(*) FROM res_partner
+            WHERE supplier_rank > 0
+              AND (company_id IS NULL OR company_id IN %s)
+        """, (tuple(_cids),))
         total_suppliers = cr.fetchone()[0] or 0
 
         cr.execute("""
-            SELECT COUNT(*) FROM res_partner WHERE customer_rank > 0
-        """)
+            SELECT COUNT(*) FROM res_partner
+            WHERE customer_rank > 0
+              AND (company_id IS NULL OR company_id IN %s)
+        """, (tuple(_cids),))
         total_customers = cr.fetchone()[0] or 0
 
         cr.execute("""
@@ -275,8 +296,9 @@ class PosReportsApi(models.Model):
             WHERE rp.supplier_rank > 0
               AND po.state = 'purchase'
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY rp.name ORDER BY total DESC LIMIT 10
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         top_suppliers = cr.fetchall()
 
         cr.execute("""
@@ -286,8 +308,9 @@ class PosReportsApi(models.Model):
             WHERE rp.customer_rank > 0
               AND po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY rp.name ORDER BY total DESC LIMIT 10
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         top_customers = cr.fetchall()
 
         summary = [
@@ -320,6 +343,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_customer_groups(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -328,8 +352,9 @@ class PosReportsApi(models.Model):
                    COUNT(*) as count
             FROM res_partner
             WHERE customer_rank > 0
+              AND (company_id IS NULL OR company_id IN %s)
             GROUP BY is_company
-        """)
+        """, (tuple(_cids),))
         group_rows = cr.fetchall()
 
         total = sum(r[1] for r in group_rows)
@@ -361,6 +386,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_stock(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -376,7 +402,8 @@ class PosReportsApi(models.Model):
             JOIN product_product pp ON pp.id = sq.product_id
             JOIN stock_location sl ON sl.id = sq.location_id
             WHERE sl.usage = 'internal'
-        """, {'company_id': str(company.id)})
+              AND sl.company_id IN %(cids)s
+        """, {'company_id': str(company.id), 'cids': tuple(_cids)})
         total_value = float(cr.fetchone()[0])
 
         cr.execute("""
@@ -385,10 +412,11 @@ class PosReportsApi(models.Model):
                 FROM stock_quant sq
                 JOIN stock_location sl ON sl.id = sq.location_id
                 WHERE sl.usage = 'internal'
+                  AND sl.company_id IN %s
                 GROUP BY sq.product_id
                 HAVING SUM(sq.quantity) <= 5 AND SUM(sq.quantity) > 0
             ) sub
-        """)
+        """, (tuple(_cids),))
         low_stock = cr.fetchone()[0] or 0
 
         cr.execute("""
@@ -399,9 +427,10 @@ class PosReportsApi(models.Model):
             JOIN product_template pt ON pt.id = pp.product_tmpl_id
             JOIN stock_location sl ON sl.id = sq.location_id
             WHERE sl.usage = 'internal'
+              AND sl.company_id IN %(cids)s
             GROUP BY pt.id, pt.name
             ORDER BY val DESC LIMIT 10
-        """, {'company_id': str(company.id)})
+        """, {'company_id': str(company.id), 'cids': tuple(_cids)})
         top_stock = cr.fetchall()
 
         product_tmpl_ids = [r[0] for r in top_stock]
@@ -438,6 +467,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_damaged_stock(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -448,8 +478,9 @@ class PosReportsApi(models.Model):
             JOIN product_product pp ON pp.id = ss.product_id
             JOIN product_template pt ON pt.id = pp.product_tmpl_id
             WHERE ss.date_done >= %s AND ss.date_done <= %s
+              AND ss.company_id IN %s
             ORDER BY ss.date_done DESC
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         scrap_rows = cr.fetchall()
 
         product_tmpl_ids = list({r[1] for r in scrap_rows})
@@ -484,6 +515,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_popular_products(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -496,10 +528,11 @@ class PosReportsApi(models.Model):
             JOIN product_template pt ON pt.id = pp.product_tmpl_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY pt.id, pt.name
             ORDER BY total_qty DESC
             LIMIT 20
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         top_products = cr.fetchall()
 
         product_tmpl_ids = [r[0] for r in top_products]
@@ -538,6 +571,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_items(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         cr = self.env.cr
 
         cr.execute(r"""
@@ -556,12 +590,13 @@ class PosReportsApi(models.Model):
                 FROM stock_quant sq
                 JOIN stock_location sl ON sl.id = sq.location_id
                 WHERE sl.usage = 'internal'
+                  AND sl.company_id IN %s
                 GROUP BY product_id
             ) sq ON sq.product_id = pp.id
             WHERE pp.active = True
             ORDER BY pt.name
             LIMIT 200
-        """)
+        """, (tuple(_cids),))
         item_rows = cr.fetchall()
 
         product_tmpl_ids = list({r[0] for r in item_rows})
@@ -594,6 +629,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_product_purchases(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -607,10 +643,11 @@ class PosReportsApi(models.Model):
             JOIN product_template pt ON pt.id = pp.product_tmpl_id
             WHERE po.state IN ('purchase', 'done')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY pt.id, pt.name
             ORDER BY total_cost DESC
             LIMIT 20
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         product_rows = cr.fetchall()
 
         product_tmpl_ids = [r[0] for r in product_rows]
@@ -649,6 +686,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_product_sales(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -662,10 +700,11 @@ class PosReportsApi(models.Model):
             JOIN product_template pt ON pt.id = pp.product_tmpl_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY pt.id, pt.name
             ORDER BY total_qty DESC
             LIMIT 20
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         product_rows = cr.fetchall()
 
         product_tmpl_ids = [r[0] for r in product_rows]
@@ -704,6 +743,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_purchases(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -713,9 +753,10 @@ class PosReportsApi(models.Model):
             FROM purchase_order po
             JOIN res_partner rp ON rp.id = po.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             ORDER BY po.date_order DESC
             LIMIT 200
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         purchase_rows = cr.fetchall()
 
         total_amount = sum(r[3] for r in purchase_rows) or 0.0
@@ -747,6 +788,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_sales(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -759,9 +801,10 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_users ru ON ru.id = po.user_id
             LEFT JOIN res_partner u ON u.id = ru.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             ORDER BY po.date_order DESC
             LIMIT 200
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         sale_rows = cr.fetchall()
 
         total_amount = sum(r[3] for r in sale_rows) or 0.0
@@ -796,6 +839,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_expenses(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -806,9 +850,10 @@ class PosReportsApi(models.Model):
             WHERE aml.date >= %s AND aml.date <= %s
               AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
               AND aml.parent_state = 'posted'
+              AND aml.company_id IN %s
             GROUP BY aa.id, aa.name
             ORDER BY amount DESC
-        """, (d_from, d_to))
+        """, (d_from, d_to, tuple(_cids)))
         expense_rows = cr.fetchall()
 
         account_ids = [r[0] for r in expense_rows]
@@ -843,22 +888,24 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_shift(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
         cr.execute("""
             SELECT ps.name, pc.name as register, rp.name as user,
                    ps.start_at, ps.stop_at, ps.state,
-                   (SELECT COUNT(*) FROM pos_order po WHERE po.session_id = ps.id) as order_count,
+                   (SELECT COUNT(*) FROM pos_order po WHERE po.session_id = ps.id AND po.company_id IN %s) as order_count,
                    ps.cash_register_balance_end_real
             FROM pos_session ps
             JOIN pos_config pc ON pc.id = ps.config_id
             LEFT JOIN res_users ru ON ru.id = ps.user_id
             LEFT JOIN res_partner rp ON rp.id = ru.partner_id
             WHERE ps.start_at >= %s AND (ps.stop_at <= %s OR ps.stop_at IS NULL)
+              AND pc.company_id IN %s
             ORDER BY ps.start_at DESC
             LIMIT 200
-        """, (dt_from, dt_to))
+        """, (tuple(_cids), dt_from, dt_to, tuple(_cids)))
         session_rows = cr.fetchall()
 
         total_sessions = len(session_rows)
@@ -904,6 +951,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_salesperson(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -917,9 +965,10 @@ class PosReportsApi(models.Model):
             JOIN res_partner rp ON rp.id = ru.partner_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             GROUP BY rp.name
             ORDER BY total_sales DESC
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         sp_rows = cr.fetchall()
 
         total_sales = sum(r[2] for r in sp_rows) or 0.0
@@ -955,6 +1004,7 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def _report_activity_log(self, date_from, date_to, **kw):
+        _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
@@ -966,9 +1016,10 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_users ru ON ru.id = po.user_id
             LEFT JOIN res_partner rp ON rp.id = ru.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
             ORDER BY po.date_order DESC
             LIMIT 100
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         order_activities = cr.fetchall()
 
         # Stock move activities
@@ -979,9 +1030,10 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_users ru ON ru.id = sml.create_uid
             LEFT JOIN res_partner rp ON rp.id = ru.partner_id
             WHERE sml.date >= %s AND sml.date <= %s
+              AND sml.company_id IN %s
             ORDER BY sml.date DESC
             LIMIT 100
-        """, (dt_from, dt_to))
+        """, (dt_from, dt_to, tuple(_cids)))
         stock_activities = cr.fetchall()
 
         all_activities = order_activities + stock_activities

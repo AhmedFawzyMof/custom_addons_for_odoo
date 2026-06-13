@@ -5,10 +5,18 @@ class WarehouseLocation(models.AbstractModel):
     _name = 'warehouse.location.api'
     _description = 'Warehouse Location API'
 
+    def _get_company_domain(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     @api.model
     def get_locations_with_capacity(self):
+        _cids = self.env.context.get('allowed_company_ids', [])
         locations = self.env['stock.location'].search_read(
-            [['usage', '=', 'internal'], ['active', '=', True]],
+            [['usage', '=', 'internal'], ['active', '=', True]]
+            + ([('company_id', 'in', _cids)] if _cids else []),
             fields=['id', 'name', 'complete_name', 'location_id']
         )
 
@@ -53,9 +61,13 @@ class WarehouseLocation(models.AbstractModel):
         Fetches the 5 most recent done stock movements, parses transaction 
         directions, and prepares optimized Arabic metadata payloads.
         """
+        _cids = self.env.context.get('allowed_company_ids', [])
+        domain = [('state', '=', 'done')]
+        if _cids:
+            domain.append(('company_id', 'in', _cids))
         # Swap 'qty_done' with 'quantity' in the fields array
         move_lines = self.env['stock.move.line'].search_read(
-            domain=[['state', '=', 'done']],
+            domain=domain,
             fields=['id', 'reference', 'product_id', 'location_id', 'location_dest_id', 'quantity', 'date'],
             order='date desc',
             limit=5
@@ -121,9 +133,11 @@ class WarehouseLocation(models.AbstractModel):
 
         offset = (page - 1) * limit
 
+        _cids = self.env.context.get('allowed_company_ids', [])
         # 1. Query the Sale Report to get product IDs sorted by total volume sold
         sales_data = self.env['sale.report'].read_group(
-            domain=[['state', 'in', ['sale', 'done']]],
+            domain=[['state', 'in', ['sale', 'done']]]
+            + ([('company_id', 'in', _cids)] if _cids else []),
             fields=['product_id', 'product_uom_qty'],
             groupby=['product_id'],
             orderby='product_uom_qty desc'

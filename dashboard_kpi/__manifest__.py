@@ -4,7 +4,7 @@
     "category": "Custom",
     "author": "Ahmed Moftah",
     "depends": ["base", "sale", "account", "stock"],
-    "data": [],
+    "data": ["security/ir.model.access.csv"],
     "installable": True,
     "application": True,
     "auto_install": False,

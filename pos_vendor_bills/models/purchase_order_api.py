@@ -11,6 +11,12 @@ class PurchaseOrderApi(models.AbstractModel):
     _name = 'purchase.order.api'
     _description = 'Purchase Order API Handler'
 
+    def _get_company_domain(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     @api.model
     def get_purchase_orders(self, params=None):
         """Fetch purchase orders with filtering and pagination."""
@@ -31,7 +37,7 @@ class PurchaseOrderApi(models.AbstractModel):
         date_to = params.get('date_to', '')
         supplier_id = params.get('supplier_id', '')
 
-        domain = []
+        domain = self._get_company_domain()
         if search_term:
             domain = ['|',
                       ('name', 'ilike', search_term),
@@ -90,6 +96,9 @@ class PurchaseOrderApi(models.AbstractModel):
         po = self.env['purchase.order'].browse(int(po_id))
         if not po.exists():
             return {'success': False, 'message': 'Purchase order not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and po.company_id.id not in _cids:
+            return {'success': False, 'message': 'Purchase order not found in this company'}
 
         lines = []
         for line in po.order_line:
@@ -128,6 +137,7 @@ class PurchaseOrderApi(models.AbstractModel):
         bills = self.env['account.move'].search([
             ('invoice_origin', '=', po.name),
             ('move_type', '=', 'in_invoice'),
+            *([('company_id', 'in', _cids)] if _cids else []),
         ])
         bill_list = [{
             'id': b.id,
@@ -212,6 +222,7 @@ class PurchaseOrderApi(models.AbstractModel):
             'order_line': order_lines,
             'notes': notes,
             'picking_type_id': picking_type.id if picking_type else False,
+            'company_id': self.env.company.id,
         }
 
         if payment_term_id:
@@ -234,6 +245,9 @@ class PurchaseOrderApi(models.AbstractModel):
         po = self.env['purchase.order'].browse(int(po_id))
         if not po.exists():
             return {'success': False, 'message': 'Purchase order not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and po.company_id.id not in _cids:
+            return {'success': False, 'message': 'Purchase order not found in this company'}
         if po.state != 'draft':
             return {'success': False, 'message': f'Cannot confirm PO in state: {po.state}'}
 
@@ -260,6 +274,9 @@ class PurchaseOrderApi(models.AbstractModel):
         po = self.env['purchase.order'].browse(int(po_id))
         if not po.exists():
             return {'success': False, 'message': 'Purchase order not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and po.company_id.id not in _cids:
+            return {'success': False, 'message': 'Purchase order not found in this company'}
         if po.state not in ('purchase', 'done'):
             return {'success': False, 'message': f'PO must be confirmed first (state: {po.state})'}
 
@@ -338,6 +355,9 @@ class PurchaseOrderApi(models.AbstractModel):
         po = self.env['purchase.order'].browse(int(po_id))
         if not po.exists():
             return {'success': False, 'message': 'Purchase order not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and po.company_id.id not in _cids:
+            return {'success': False, 'message': 'Purchase order not found in this company'}
         if po.state not in ('purchase', 'done'):
             return {'success': False, 'message': 'PO must be confirmed to create a bill'}
 

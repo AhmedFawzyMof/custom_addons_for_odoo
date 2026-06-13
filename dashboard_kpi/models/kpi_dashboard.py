@@ -7,6 +7,10 @@ class KpiDashboard(models.Model):
     _description = 'KPI Dashboard'
     _auto = False
 
+    def _get_allowed_companies(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        return cids or self.env.user.company_ids.ids
+
     def _parse_date(self, value, fallback):
         """Ensure date is valid YYYY-MM-DD string"""
         if not value:
@@ -36,15 +40,18 @@ class KpiDashboard(models.Model):
         d_to = date_to
 
         # 1. Revenue - ORM query includes both POS orders and Sales Orders
+        _company_ids = self._get_allowed_companies()
         pos_domain = [
             ('state', 'in', ('paid', 'done', 'invoiced')),
             ('date_order', '>=', dt_from),
             ('date_order', '<=', dt_to),
+            ('company_id', 'in', _company_ids),
         ]
         so_domain = [
             ('state', 'in', ('sale', 'done')),
             ('date_order', '>=', dt_from),
             ('date_order', '<=', dt_to),
+            ('company_id', 'in', _company_ids),
         ]
 
         pos_revenue = sum(self.env['pos.order'].search(pos_domain).mapped('amount_total'))
@@ -61,7 +68,8 @@ class KpiDashboard(models.Model):
               AND aml.date <= %s
               AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
               AND aml.parent_state = 'posted'
-        """, (d_from, d_to))
+              AND aml.company_id IN %s
+        """, (d_from, d_to, tuple(_company_ids)))
         total_expenses = cr.fetchone()[0] or 0
 
         # 3. Low Stock
@@ -72,7 +80,8 @@ class KpiDashboard(models.Model):
             WHERE sl.usage = 'internal'
               AND sq.quantity <= 5
               AND sq.quantity > 0
-        """)
+              AND sl.company_id IN %s
+        """, (tuple(_company_ids),))
         low_stock_count = cr.fetchone()[0] or 0
 
         # 4. Customers
@@ -80,7 +89,8 @@ class KpiDashboard(models.Model):
             SELECT COUNT(*)
             FROM res_partner
             WHERE customer_rank > 0
-        """)
+              AND (company_id IS NULL OR company_id IN %s)
+        """, (tuple(_company_ids),))
         total_customers = cr.fetchone()[0] or 0
 
         return {
@@ -94,6 +104,7 @@ class KpiDashboard(models.Model):
     
     @api.model
     def get_storage_kpi(self):
+        _company_ids = self._get_allowed_companies()
         cr = self.env.cr
         company = self.env.company
         cr.execute("""
@@ -103,7 +114,8 @@ class KpiDashboard(models.Model):
     JOIN stock_location sl ON sl.id = sq.location_id
     WHERE sl.usage = 'internal'
       AND sq.product_id NOT IN (1, 2, 3)
-""", {'company_id': str(company.id)})
+      AND sl.company_id IN %(company_ids)s
+""", {'company_id': str(company.id), 'company_ids': tuple(_company_ids)})
         inventory_value = cr.fetchone()[0] or 0
         
         cr.execute("""
@@ -115,8 +127,9 @@ class KpiDashboard(models.Model):
             FROM stock_quant sq
             JOIN stock_location sl ON sl.id = sq.location_id
             WHERE sl.usage = 'internal' AND sq.quantity > 0
+              AND sl.company_id IN %s
         )
-        """)
+        """, (tuple(_company_ids),))
         out_of_stock = cr.fetchone()[0] or 0
 
         cr.execute("""
@@ -125,7 +138,8 @@ class KpiDashboard(models.Model):
         JOIN stock_location sl ON sl.id = sq.location_id
         WHERE sl.usage = 'internal'
           AND sq.product_id NOT IN (1, 2, 3)
-        """)
+          AND sl.company_id IN %s
+        """, (tuple(_company_ids),))
         total_quantity = cr.fetchone()[0] or 0
 
         cr.execute("""
@@ -135,7 +149,8 @@ class KpiDashboard(models.Model):
         AND picking_type_id IN (
             SELECT id FROM stock_picking_type WHERE code = 'incoming'
         )
-        """)
+        AND company_id IN %s
+        """, (tuple(_company_ids),))
         incoming_shipments = cr.fetchone()[0] or 0
         
         return {

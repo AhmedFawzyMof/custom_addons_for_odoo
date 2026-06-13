@@ -10,6 +10,13 @@ _logger = logging.getLogger(__name__)
 class PosConfig(models.Model):
     _inherit = 'pos.config'
 
+    def _get_company_domain(self):
+        """Return company filter domain from context, or empty."""
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     @api.model
     def _ensure_payment_methods_before_open(self, config_id_int):
         """
@@ -160,6 +167,7 @@ class PosConfig(models.Model):
         limit       = kwargs.get('limit')       or (args[2] if len(args) > 2 else 50)
         category_id = kwargs.get('category_id') or (args[3] if len(args) > 3 else None)
         location_id = kwargs.get('location_id') or (args[4] if len(args) > 4 else None)
+        search_text = kwargs.get('search_text') or (args[5] if len(args) > 5 else '')
 
         if not config_id:
             return {'status': 'error', 'message': 'Missing config_id parameter'}
@@ -172,11 +180,16 @@ class PosConfig(models.Model):
         if not pos_config.exists():
             return {'status': 'error', 'message': 'POS Config not found'}
 
+        config_company_id = pos_config.company_id.id
+
         page  = max(1, int(page))
         limit = max(1, int(limit))
         offset = (page - 1) * limit
 
-        warehouses = self.env['stock.warehouse'].search_read([], ['id', 'name', 'code', 'lot_stock_id'])
+        warehouses = self.env['stock.warehouse'].search_read(
+            ['|', ('company_id', '=', False), ('company_id', '=', config_company_id)],
+            ['id', 'name', 'code', 'lot_stock_id']
+        )
 
         has_location_filter = False
         if location_id and str(location_id).strip() not in ('', 'null'):
@@ -188,7 +201,10 @@ class PosConfig(models.Model):
         else:
             location_ids = [w['lot_stock_id'][0] for w in warehouses if w['lot_stock_id']]
 
-        product_domain = [('available_in_pos', '=', True)]
+        product_domain = [
+            ('available_in_pos', '=', True),
+            '|', ('company_id', '=', False), ('company_id', '=', config_company_id),
+        ]
 
         if category_id and str(category_id).strip() not in ('', 'null'):
             try:
@@ -205,9 +221,23 @@ class PosConfig(models.Model):
             available_product_ids = list(set(quant_records.mapped('product_id.id')))
             product_domain.append(('id', 'in', available_product_ids))
 
+        if search_text:
+            search_text = search_text.strip()
+            product_domain.append('|')
+            product_domain.append('|')
+            product_domain.append(('name', 'ilike', search_text))
+            product_domain.append(('default_code', 'ilike', search_text))
+            product_domain.append(('barcode', 'ilike', search_text))
+
         category_counts_domain = [('available_in_pos', '=', True)]
         if has_location_filter:
             category_counts_domain.append(('id', 'in', available_product_ids))
+        if search_text:
+            category_counts_domain.append('|')
+            category_counts_domain.append('|')
+            category_counts_domain.append(('name', 'ilike', search_text))
+            category_counts_domain.append(('default_code', 'ilike', search_text))
+            category_counts_domain.append(('barcode', 'ilike', search_text))
 
         count_data = self.env['product.product'].read_group(
             domain=category_counts_domain,
@@ -220,7 +250,10 @@ class PosConfig(models.Model):
                 cat_id = line['pos_categ_ids'][0]
                 category_counts_map[cat_id] = line['pos_categ_ids_count']
 
-        raw_categories = self.env['pos.category'].search_read([], ['id', 'name', 'parent_id'])
+        raw_categories = self.env['pos.category'].search_read(
+            ['|', ('company_id', '=', False), ('company_id', '=', config_company_id)],
+            ['id', 'name', 'parent_id']
+        )
         category_map   = {c['id']: c['name'] for c in raw_categories}
 
         categories_with_counts = [{
@@ -234,7 +267,10 @@ class PosConfig(models.Model):
             [('id', 'in', pos_config.payment_method_ids.ids)],
             ['id', 'name', 'is_cash_count']
         )
-        pricelists = self.env['product.pricelist'].search_read([], ['id', 'name', 'currency_id'])
+        pricelists = self.env['product.pricelist'].search_read(
+            ['|', ('company_id', '=', False), ('company_id', '=', config_company_id)],
+            ['id', 'name', 'currency_id']
+        )
 
         total_products = self.env['product.product'].search_count(product_domain)
         products = self.env['product.product'].search(product_domain, limit=limit, offset=offset, order='id asc')
@@ -293,7 +329,9 @@ class PosConfig(models.Model):
             if defaults.get('pricelist_id'):
                 values['pricelist_id'] = defaults['pricelist_id']
             else:
-                pricelist = self.env['product.pricelist'].search([], limit=1)
+                pricelist = self.env['product.pricelist'].search(
+                    self.env['product.pricelist']._check_company_domain(self.env.company), limit=1,
+                )
                 if not pricelist:
                     pricelist = self.env['product.pricelist'].create({
                         'name':        'قائمة أسعار افتراضية تلقائية',
@@ -305,7 +343,9 @@ class PosConfig(models.Model):
             if defaults.get('warehouse_id'):
                 values['warehouse_id'] = defaults['warehouse_id']
             else:
-                warehouse = self.env['stock.warehouse'].search([], limit=1)
+                warehouse = self.env['stock.warehouse'].search(
+                    self.env['stock.warehouse']._check_company_domain(self.env.company), limit=1,
+                )
                 if not warehouse:
                     self.env.cr.execute('ROLLBACK TO SAVEPOINT sp_create_register')
                     return {'status': 'error', 'message': 'لا يوجد مخزن. الرجاء إنشاء واحد أولاً.'}
@@ -326,7 +366,9 @@ class PosConfig(models.Model):
     def get_all_registers_with_status_rpc(self, *args, **kwargs):
         """Fetches all POS terminals with their most recent session state."""
         try:
-            configs = self.sudo().search_read([], ['id', 'name'])
+            configs = self.sudo().search_read(
+                self._get_company_domain(), ['id', 'name'],
+            )
             if not configs:
                 return {'status': 'success', 'data': []}
 
@@ -822,7 +864,7 @@ class ProductProduct(models.Model):
             if not product.exists():
                 return {'status': 'error', 'message': 'Product not found'}
 
-            warehouses = self.env['stock.warehouse'].search([])
+            warehouses = self.env['stock.warehouse'].search(self._get_company_domain())
             stock_balances = {}
             for wh in warehouses:
                 if wh.lot_stock_id:

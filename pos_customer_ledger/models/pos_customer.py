@@ -4,6 +4,12 @@ from odoo import models, fields, api
 class ResPartner(models.Model):
     _inherit = 'res.partner'
 
+    def _get_company_domain(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     @api.model
     def get_pos_frontend_customers(self, params=None):
         """
@@ -25,7 +31,7 @@ class ResPartner(models.Model):
         type_filter = params.get('type', 'الكل')
 
         # 1. Base Security Filtering (Exclude Users, Employees & Main Company)
-        active_users = self.env['res.users'].search([])
+        active_users = self.env['res.users'].search(self._get_company_domain())
         exclude_partner_ids = active_users.mapped('partner_id.id')
         
         # Find parent companies of internal employees/users
@@ -84,7 +90,8 @@ class ResPartner(models.Model):
         total_spent_map = {}
         sale_orders = self.env['sale.order'].search([
             ('partner_id', 'in', partner_ids),
-            ('state', 'not in', ['draft', 'cancel', 'sent'])
+            ('state', 'not in', ['draft', 'cancel', 'sent']),
+            *self._get_company_domain(),
         ])
         for order in sale_orders:
             pid = order.partner_id.id
@@ -95,7 +102,8 @@ class ResPartner(models.Model):
             invoices = self.env['account.move'].search([
                 ('partner_id', 'in', missing_spent_ids),
                 ('move_type', '=', 'out_invoice'),
-                ('state', '=', 'posted')
+                ('state', '=', 'posted'),
+                *self._get_company_domain(),
             ])
             for inv in invoices:
                 pid = inv.partner_id.id
@@ -199,7 +207,8 @@ class ResPartner(models.Model):
         total_spent = 0.0
         sale_orders = self.env['sale.order'].search([
             ('partner_id', '=', partner.id),
-            ('state', 'not in', ['draft', 'cancel', 'sent'])
+            ('state', 'not in', ['draft', 'cancel', 'sent']),
+            *self._get_company_domain(),
         ], order='date_order desc')
         
         for order in sale_orders:

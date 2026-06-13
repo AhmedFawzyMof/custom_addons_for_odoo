@@ -3,7 +3,7 @@
     "version": "1.0",
     "depends": ["stock"],
     "author": "Ahmed Moftah",
-    "data": [],
+    "data": ["security/ir.model.access.csv"],
     "installable": True,
     "auto_install": False,
     "application": True,

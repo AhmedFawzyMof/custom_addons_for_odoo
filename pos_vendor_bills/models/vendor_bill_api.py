@@ -6,6 +6,12 @@ class VendorBillApi(models.AbstractModel):
     _name = 'vendor.bill.api'
     _description = 'Vendor Bill API Handler'
 
+    def _get_company_domain(self):
+        cids = self.env.context.get('allowed_company_ids', [])
+        if cids:
+            return [('company_id', 'in', cids)]
+        return []
+
     @api.model
     def get_vendor_bills(self, params=None):
         """Fetch vendor bills (account.move type: in_invoice) with filtering and pagination."""
@@ -26,7 +32,7 @@ class VendorBillApi(models.AbstractModel):
         date_to = params.get('date_to', '')
         supplier_id = params.get('supplier_id', '')
 
-        domain = [('move_type', '=', 'in_invoice')]
+        domain = [('move_type', '=', 'in_invoice'), *self._get_company_domain()]
 
         if search_term:
             domain = ['|',
@@ -95,6 +101,9 @@ class VendorBillApi(models.AbstractModel):
         bill = self.env['account.move'].browse(int(bill_id))
         if not bill.exists() or bill.move_type != 'in_invoice':
             return {'success': False, 'message': 'Vendor bill not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and bill.company_id.id not in _cids:
+            return {'success': False, 'message': 'Vendor bill not found in this company'}
 
         # Invoice lines
         lines = []
@@ -114,6 +123,7 @@ class VendorBillApi(models.AbstractModel):
         # Linked purchase orders
         purchase_orders = self.env['purchase.order'].search([
             ('invoice_ids', 'in', bill.id),
+            *([('company_id', 'in', _cids)] if _cids else []),
         ])
         po_list = [{
             'id': po.id,
@@ -229,6 +239,9 @@ class VendorBillApi(models.AbstractModel):
         bill = self.env['account.move'].browse(int(bill_id))
         if not bill.exists() or bill.move_type != 'in_invoice':
             return {'success': False, 'message': 'Vendor bill not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and bill.company_id.id not in _cids:
+            return {'success': False, 'message': 'Vendor bill not found in this company'}
 
         try:
             if new_status == 'posted' and bill.state == 'draft':
@@ -265,6 +278,9 @@ class VendorBillApi(models.AbstractModel):
         bill = self.env['account.move'].browse(int(bill_id))
         if not bill.exists() or bill.move_type != 'in_invoice':
             return {'success': False, 'message': 'Vendor bill not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and bill.company_id.id not in _cids:
+            return {'success': False, 'message': 'Vendor bill not found in this company'}
 
         if bill.state != 'posted':
             return {'success': False, 'message': 'Bill must be posted before payment'}
