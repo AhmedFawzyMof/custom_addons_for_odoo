@@ -31,21 +31,23 @@ class ResPartner(models.Model):
         type_filter = params.get('type', 'الكل')
 
         # 1. Base Security Filtering (Exclude Users, Employees & Main Company)
-        active_users = self.env['res.users'].search(self._get_company_domain())
+        active_users = self.env['res.users'].sudo().with_context(active_test=False).search([])
         exclude_partner_ids = active_users.mapped('partner_id.id')
         
         # Find parent companies of internal employees/users
         parent_partners = active_users.mapped('partner_id.parent_id.id')
         
-        # CRITICAL FIX: Find your main company's partner ID and inject it into the exclusion array
-        current_main_company_partner = self.env.company.partner_id.id
+        # Exclude all companies' partner records (not just the current one)
+        company_partner_ids = self.env['res.company'].sudo().search([]).mapped('partner_id.id')
         
         # Merge all exclusions dynamically together into a unique list
-        exclude_partner_ids = list(set(exclude_partner_ids + parent_partners + [current_main_company_partner]))
+        exclude_partner_ids = list(set(exclude_partner_ids + parent_partners + company_partner_ids))
 
         domain = [
             ('id', 'not in', exclude_partner_ids),
-            ('active', '=', True)
+            ('active', '=', True),
+            ('supplier_rank', '=', 0),
+            ('customer_rank', '>', 0),
         ]
 
         # 2. Filter by Segment (Retail Person vs Corporate B2B)
