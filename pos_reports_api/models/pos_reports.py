@@ -1,5 +1,5 @@
 from odoo import models, api, fields
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from collections import defaultdict
 
 
@@ -1063,6 +1063,132 @@ class PosReportsApi(models.Model):
         return {"summary": summary, "columns": columns, "rows": rows}
 
     # ---------------------------------------------------------------
+    # 18. Late Payments Report
+    # ---------------------------------------------------------------
+    @api.model
+    def _report_late_payments(self, date_from, date_to, **kw):
+        today = date.today()
+        _cids = self._get_allowed_companies()
+        cr = self.env.cr
+
+        company_domain = [('company_id', 'in', tuple(_cids))] if _cids else []
+
+        # Overdue vendor bills
+        bill_domain = [
+            ('move_type', '=', 'in_invoice'),
+            ('state', '=', 'posted'),
+            ('payment_state', '!=', 'paid'),
+            ('invoice_date_due', '<', today),
+        ] + company_domain
+        bills = self.env['account.move'].search(bill_domain, order='invoice_date_due asc')
+
+        bill_items = []
+        for b in bills:
+            days_overdue = (today - b.invoice_date_due).days if b.invoice_date_due else 0
+            bucket = '90+'
+            if days_overdue <= 30:
+                bucket = '0-30'
+            elif days_overdue <= 60:
+                bucket = '30-60'
+            elif days_overdue <= 90:
+                bucket = '60-90'
+            bill_items.append({
+                'bucket': bucket,
+                'amount': b.amount_residual,
+                'reference': b.name,
+                'partner': b.partner_id.name if b.partner_id else '',
+                'date_due': b.invoice_date_due.strftime('%Y-%m-%d') if b.invoice_date_due else '',
+                'days': days_overdue,
+            })
+
+        # Overdue purchase orders (confirmed but not fully received)
+        po_domain = [
+            ('state', '=', 'purchase'),
+            ('receipt_status', 'in', ('pending', 'partial')),
+        ] + company_domain
+        pos = self.env['purchase.order'].search(po_domain, order='date_order asc')
+
+        po_items = []
+        for po in pos:
+            date_planned = po.order_line and min(
+                (l.date_planned.date() for l in po.order_line if l.date_planned),
+                default=None
+            )
+            days_overdue = 0
+            if date_planned and date_planned < today:
+                days_overdue = (today - date_planned).days
+            elif not date_planned and po.date_order:
+                po_date = po.date_order.date() if hasattr(po.date_order, 'date') else po.date_order
+                if po_date < today:
+                    days_overdue = (today - po_date).days
+            if days_overdue <= 0:
+                continue
+
+            bucket = '90+'
+            if days_overdue <= 30:
+                bucket = '0-30'
+            elif days_overdue <= 60:
+                bucket = '30-60'
+            elif days_overdue <= 90:
+                bucket = '60-90'
+
+            po_items.append({
+                'bucket': bucket,
+                'amount': po.amount_total,
+                'reference': po.name,
+                'partner': po.partner_id.name if po.partner_id else '',
+                'date_due': date_planned.strftime('%Y-%m-%d') if date_planned else '',
+                'days': days_overdue,
+            })
+
+        all_items = bill_items + po_items
+
+        # Summary cards
+        total_overdue = len(all_items)
+        total_amount = sum(i['amount'] for i in all_items)
+        buckets = defaultdict(int)
+        bucket_amounts = defaultdict(float)
+        for i in all_items:
+            buckets[i['bucket']] += 1
+            bucket_amounts[i['bucket']] += i['amount']
+
+        summary = [
+            {"label": "إجمالي المتأخرات", "value": str(total_overdue), "icon": "file_warning", "color": "error"},
+            {"label": "القيمة المتأخرة", "value": f"{total_amount:,.2f}", "icon": "banknote", "color": "error"},
+            {"label": "فواتير متأخرة", "value": str(len(bill_items)), "icon": "receipt", "color": "primary"},
+            {"label": "أوامر شراء متأخرة", "value": str(len(po_items)), "icon": "clipboard_list", "color": "tertiary"},
+        ]
+
+        # Chart: aging buckets bar
+        chart = {
+            "type": "bar",
+            "labels": ['0-30 يوم', '30-60 يوم', '60-90 يوم', 'أكثر من 90 يوم'],
+            "datasets": [
+                {"label": "العدد", "data": [buckets.get('0-30', 0), buckets.get('30-60', 0), buckets.get('60-90', 0), buckets.get('90+', 0)]},
+            ],
+        }
+
+        columns = [
+            {"key": "type", "label": "النوع"},
+            {"key": "reference", "label": "المرجع"},
+            {"key": "partner", "label": "المورد"},
+            {"key": "date_due", "label": "تاريخ الاستحقاق"},
+            {"key": "days", "label": "أيام التأخير", "type": "number"},
+            {"key": "bucket", "label": "الفترة"},
+            {"key": "amount", "label": "المبلغ", "type": "number"},
+        ]
+        rows = (
+            [{"type": "فاتورة مورد", "reference": i['reference'], "partner": i['partner'],
+              "date_due": i['date_due'], "days": i['days'], "bucket": i['bucket'],
+              "amount": float(i['amount'])} for i in bill_items] +
+            [{"type": "أمر شراء", "reference": i['reference'], "partner": i['partner'],
+              "date_due": i['date_due'], "days": i['days'], "bucket": i['bucket'],
+              "amount": float(i['amount'])} for i in po_items]
+        )
+
+        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+
+    # ---------------------------------------------------------------
     # Main entry point
     # ---------------------------------------------------------------
     @api.model
@@ -1085,6 +1211,7 @@ class PosReportsApi(models.Model):
             "shift": "_report_shift",
             "salesperson": "_report_salesperson",
             "activity_log": "_report_activity_log",
+            "late_payments": "_report_late_payments",
         }
         method_name = method_map.get(report_type)
         if not method_name:

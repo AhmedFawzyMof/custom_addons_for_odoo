@@ -47,7 +47,6 @@ class ResPartner(models.Model):
             ('id', 'not in', exclude_partner_ids),
             ('active', '=', True),
             ('supplier_rank', '=', 0),
-            ('customer_rank', '>', 0),
         ]
 
         # 2. Filter by Segment (Retail Person vs Corporate B2B)
