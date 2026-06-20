@@ -7,6 +7,7 @@
         'account',
         'stock',
         'base',
+        'point_of_sale',
         'account_invoice_supplier_ref_unique',
         'account_invoice_supplierinfo_update',
         'account_invoice_date_due',

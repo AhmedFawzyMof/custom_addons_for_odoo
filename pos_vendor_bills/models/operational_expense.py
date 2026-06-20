@@ -42,10 +42,10 @@ class OperationalExpense(models.Model):
     move_id = fields.Many2one('account.move', string='Journal Entry', readonly=True)
     expense_account_id = fields.Many2one('account.account', string='Expense Account',
                                           domain=[('account_type', 'in', ('expense', 'expense_depreciation', 'expense_direct_cost'))],
-                                          required=True)
+                                          required=False)
     payment_account_id = fields.Many2one('account.account', string='Payment Account',
                                           domain=[('account_type', 'in', ('asset_cash', 'asset_current', 'liability_current'))],
-                                          required=True)
+                                          required=False)
 
     @api.model
     def _get_default_expense_journal(self):
@@ -84,7 +84,7 @@ class OperationalExpense(models.Model):
         acct_type = mapping.get(category, 'expense')
         account = self.env['account.account'].search([
             ('account_type', '=', acct_type),
-            ('company_id', '=', self.env.company.id),
+            ('company_ids', '=', self.env.company.id),
             ('deprecated', '=', False),
         ], limit=1)
         return account
@@ -101,13 +101,13 @@ class OperationalExpense(models.Model):
             if not rec.payment_account_id:
                 cash_account = self.env['account.account'].search([
                     ('account_type', '=', 'asset_cash'),
-                    ('company_id', '=', rec.company_id.id),
+                    ('company_ids', '=', rec.company_id.id),
                     ('deprecated', '=', False),
                 ], limit=1)
                 if not cash_account:
                     cash_account = self.env['account.account'].search([
                         ('account_type', '=', 'asset_current'),
-                        ('company_id', '=', rec.company_id.id),
+                        ('company_ids', '=', rec.company_id.id),
                         ('deprecated', '=', False),
                     ], limit=1)
                 if not cash_account:

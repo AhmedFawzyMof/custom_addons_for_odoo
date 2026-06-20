@@ -1,6 +1,7 @@
 import uuid
 import logging
 from odoo import models, api, fields
+from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
@@ -275,6 +276,24 @@ class PosConfig(models.Model):
         total_products = self.env['product.product'].search_count(product_domain)
         products = self.env['product.product'].search(product_domain, limit=limit, offset=offset, order='id asc')
 
+        # Pre-compute attribute lines per template (all attribute options for variant picker)
+        template_ids = set(prod.product_tmpl_id.id for prod in products)
+        template_attr_map = {}
+        for tmpl_id in template_ids:
+            tmpl = self.env['product.template'].browse(tmpl_id)
+            lines = []
+            for line in tmpl.attribute_line_ids:
+                lines.append({
+                    'id':     line.attribute_id.id,
+                    'name':   line.attribute_id.name,
+                    'values': [{
+                        'id':          ptav.product_attribute_value_id.id,
+                        'name':        ptav.product_attribute_value_id.name,
+                        'price_extra': ptav.price_extra,
+                    } for ptav in line.product_template_value_ids],
+                })
+            template_attr_map[tmpl_id] = lines
+
         product_list = []
         for prod in products:
             stock_per_location = {}
@@ -282,15 +301,31 @@ class PosConfig(models.Model):
                 qty = prod.with_context(location=loc_id).qty_available
                 stock_per_location[str(loc_id)] = qty
 
+            # Collect attribute values for this variant
+            attribute_values = []
+            for ptav in prod.product_template_attribute_value_ids:
+                attribute_values.append({
+                    'attr_id':    ptav.attribute_id.id,
+                    'attr_name':  ptav.attribute_id.name,
+                    'value_id':   ptav.id,
+                    'value_name': ptav.name,
+                })
+
             product_list.append({
                 'id':               prod.id,
+                'product_tmpl_id':  prod.product_tmpl_id.id,
                 'display_name':     prod.display_name,
                 'lst_price':        prod.lst_price,
                 'barcode':          prod.barcode,
                 'to_weight':        bool(prod.to_weight),
+                'type':             prod.type or 'product',
+                'weight':           prod.weight or 0.0,
                 'stock_by_location': stock_per_location,
                 'pos_categories':   [{'id': cid, 'name': category_map.get(cid, '')} for cid in prod.pos_categ_ids.ids],
                 'taxes_id':         prod.taxes_id.ids,
+                'attribute_values': attribute_values,
+                'attribute_lines':  template_attr_map.get(prod.product_tmpl_id.id, []),
+                'price_extra':      sum(ptav.price_extra for ptav in prod.product_template_attribute_value_ids),
             })
 
         total_pages = (total_products + limit - 1) // limit
@@ -475,6 +510,7 @@ class PosSession(models.Model):
         config_id    = kwargs.get('config_id')    or (args[0] if len(args) > 0 else None)
         action       = kwargs.get('action')       or (args[1] if len(args) > 1 else None)
         opening_cash = kwargs.get('opening_cash') or (args[2] if len(args) > 2 else 0.0)
+        force_close  = kwargs.get('force_close') in (True, 'true', 'True', 1, '1') or (args[3] if len(args) > 3 else False)
 
         if not config_id or str(config_id).strip() in ('', 'config_id'):
             return {'status': 'error', 'message': 'Missing or invalid config_id'}
@@ -551,10 +587,14 @@ class PosSession(models.Model):
 
             draft_orders = current_session.order_ids.filtered(lambda o: o.state == 'draft')
             if draft_orders:
-                return {
-                    'status':  'error',
-                    'message': f'Cannot close: {len(draft_orders)} draft order(s) still open.',
-                }
+                if force_close:
+                    draft_orders.sudo().write({'state': 'cancel'})
+                else:
+                    return {
+                        'status': 'error',
+                        'message': f'Cannot close: {len(draft_orders)} draft order(s) still open.',
+                        'draft_count': len(draft_orders),
+                    }
 
             try:
                 # تهيئة بيئة تشغيلية مطابقة للشركة والسياق المحاسبي لمنع الأخطاء المتداخلة
@@ -578,7 +618,12 @@ class PosSession(models.Model):
                 if session_sudo.state == 'closing_control':
                     try:
                         # استدعاء المعالج الأصلي المعتمد للإغلاق والترحيل المحاسبي
-                        session_sudo._validate_session()
+                        result = session_sudo._validate_session()
+                        # _validate_session قد ترجع قاموس (نافذة الإغلاق القسري) عندما يكون القيد محاسبي غير متوازن
+                        # وفي هذه الحالة تقوم بعمل rollback للترانزاكشن مما يعيد حالة الجلسة إلى opened
+                        # نحتاج للتعامل مع هذه الحالة يدوياً
+                        if isinstance(result, dict):
+                            raise UserError(result.get('name', 'Account move unbalanced'))
                     except Exception as val_err:
                         _logger.error(f"_validate_session raised: {val_err}", exc_info=True)
                         # حل بديل طارئ في حال تعطل قيود التسوية التلقائية لإجبار الجلسة على الإغلاق
@@ -590,6 +635,8 @@ class PosSession(models.Model):
                         self.env.cr.flush()
 
                 # جلب الحالة النهائية المستقرة في قاعدة البيانات بعد الـ Validation
+                # إعادة تحميل cache الجلسة لأن rollback قد يكون مسح التغييرات
+                self.env['pos.session'].sudo().browse(session_id).read(['state'])
                 final_state = self.env['pos.session'].sudo().browse(session_id).state
 
                 return {
@@ -782,8 +829,8 @@ class PosOrder(models.Model):
                         'payment_date': fields.Datetime.now(),
                     }))
 
-            final_total = total_order_subtotal + (service_fee if service_fee > 0 else 0)
-            frontend_tax = payload.get('amount_tax', 0.0)
+            frontend_tax = float(payload.get('amount_tax', 0.0))
+            final_total = total_order_subtotal + (service_fee if service_fee > 0 else 0) + frontend_tax
 
             # 4. تجميع بيانات الطلب الرئيسي مع تلبية شروط قواعد البيانات الصارمة للأعمدة المطلوبة
             pos_order_vals = {
@@ -824,8 +871,19 @@ class PosOrder(models.Model):
 
             # 6. تحديث حسابات الطلب وتأكيد عمليات المخازن والترحيل تلقائياً
             new_order._compute_total_all_at_once() if hasattr(new_order, '_compute_total_all_at_once') else None
-            
+
             if new_order.payment_ids:
+                if new_order.amount_return > 0:
+                    cash_method = session.payment_method_ids.filtered('is_cash_count')[:1]
+                    if cash_method:
+                        new_order.add_payment({
+                            'name': 'return',
+                            'pos_order_id': new_order.id,
+                            'amount': -new_order.amount_return,
+                            'payment_date': fields.Datetime.now(),
+                            'payment_method_id': cash_method.id,
+                            'is_change': True,
+                        })
                 new_order.action_pos_order_paid()
             
             if hasattr(new_order, '_create_order_picking'):
