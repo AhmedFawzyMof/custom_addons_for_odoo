@@ -15,15 +15,15 @@ class WarehouseLocation(models.AbstractModel):
     def get_locations_with_capacity(self):
         _cids = self.env.context.get('allowed_company_ids', [])
         locations = self.env['stock.location'].search_read(
-            [['usage', '=', 'internal'], ['active', '=', True]]
+            [['usage', 'in', ['internal', 'view', 'inventory']], ['active', '=', True]]
             + ([('company_id', 'in', _cids)] if _cids else []),
-            fields=['id', 'name', 'complete_name', 'location_id']
+            fields=['id', 'name', 'complete_name', 'location_id', 'usage', 'max_capacity']
         )
 
-        location_ids = [l['id'] for l in locations]
+        internal_ids = [l['id'] for l in locations if l['usage'] == 'internal']
 
         quants = self.env['stock.quant'].search_read(
-            [['location_id', 'in', location_ids]],
+            [['location_id', 'in', internal_ids]],
             fields=['location_id', 'quantity']
         )
 
@@ -32,26 +32,49 @@ class WarehouseLocation(models.AbstractModel):
             loc_id = quant['location_id'][0]
             qty_map[loc_id] = qty_map.get(loc_id, 0) + quant['quantity']
 
-        MAX_CAPACITY = 5000
         result = []
         for loc in locations:
-            total_qty = round(qty_map.get(loc['id'], 0))
-            percentage = min(round((total_qty / MAX_CAPACITY) * 100), 100)
-            is_full = percentage >= 90
+            usage = loc['usage']
+            name = (f"{loc['location_id'][1]} / المخزن الأساسي"
+                    if loc['name'] == 'Stock' and loc['location_id']
+                    else loc['name'])
 
-            result.append({
-                'id': loc['id'],
-                'name': f"{loc['location_id'][1]} / المخزن الأساسي"
-                        if loc['name'] == 'Stock' and loc['location_id']
-                        else loc['name'],
-                'address': loc['complete_name'],
-                'status': 'كامل السعة' if is_full else 'نشط',
-                'statusColor': 'bg-secondary-container/20 text-secondary' if is_full else 'bg-primary-container/20 text-primary',
-                'qty': f"{total_qty:,}",
-                'capacity': f"{percentage}%",
-                'capacityWidth': f"w-[{percentage}%]",
-                'progressBarColor': 'bg-error' if is_full else 'bg-primary',
-            })
+            if usage == 'internal':
+                total_qty = round(qty_map.get(loc['id'], 0))
+                max_cap = loc.get('max_capacity') or 5000
+                percentage = min(round((total_qty / max_cap) * 100), 100)
+                is_full = percentage >= 90
+
+                result.append({
+                    'id': loc['id'],
+                    'name': name,
+                    'address': loc['complete_name'],
+                    'type': 'internal',
+                    'status': 'كامل السعة' if is_full else 'نشط',
+                    'statusColor': 'bg-primary-container/20 text-primary' if not is_full else 'bg-error-container/30 text-error',
+                    'qty': f"{total_qty:,}",
+                    'maxCapacity': int(max_cap),
+                    'usedQty': total_qty,
+                    'capacity': f"{percentage}%",
+                    'capacityWidth': f"w-[{percentage}%]",
+                    'progressBarColor': 'bg-error' if is_full else 'bg-primary',
+                })
+            elif usage == 'view':
+                result.append({
+                    'id': loc['id'],
+                    'name': name,
+                    'address': loc['complete_name'],
+                    'type': 'view',
+                    'qty': '—',
+                })
+            elif usage == 'inventory':
+                result.append({
+                    'id': loc['id'],
+                    'name': name,
+                    'address': loc['complete_name'],
+                    'type': 'scrap',
+                    'qty': '—',
+                })
 
         return result
 

@@ -1,6 +1,9 @@
 from odoo import models, api, fields
 from datetime import datetime, date, timezone, timedelta
 from collections import defaultdict
+import logging
+
+_logger = logging.getLogger(__name__)
 
 
 class PosReportsApi(models.Model):
@@ -69,6 +72,28 @@ class PosReportsApi(models.Model):
         so_revenue = float(cr.fetchone()[0])
         total_revenue = pos_revenue + so_revenue
 
+        # Payment totals by method type (cash / bank / pay_later)
+        cr.execute("""
+            SELECT CASE
+                WHEN pj.type = 'cash' THEN 'cash'
+                WHEN pj.type = 'bank' THEN 'bank'
+                ELSE 'pay_later'
+            END as payment_type,
+            COALESCE(SUM(pp.amount), 0)
+            FROM pos_payment pp
+            JOIN pos_order po ON po.id = pp.pos_order_id
+            JOIN pos_payment_method ppm ON ppm.id = pp.payment_method_id
+            LEFT JOIN account_journal pj ON pj.id = ppm.journal_id
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+            GROUP BY payment_type
+        """, (dt_from, dt_to, tuple(_cids)))
+        payment_totals = dict(cr.fetchall())
+        cash_total = payment_totals.get('cash', 0.0)
+        card_total = payment_totals.get('bank', 0.0)
+        account_total = payment_totals.get('pay_later', 0.0)
+
         # Expenses by category
         cr.execute("""
             SELECT aa.name, COALESCE(SUM(aml.debit - aml.credit), 0) as amount
@@ -105,6 +130,9 @@ class PosReportsApi(models.Model):
             {"label": "تكلفة البضاعة", "value": f"{cogs:,.2f}", "icon": "shopping_cart", "color": "tertiary"},
             {"label": "إجمالي الربح", "value": f"{gross_profit:,.2f}", "icon": "account_balance_wallet", "color": "secondary"},
             {"label": "صافي الربح", "value": f"{net_profit:,.2f}", "icon": "payments", "color": "primary" if net_profit >= 0 else "error"},
+            {"label": "إجمالي النقدي", "value": f"{cash_total:,.2f}", "icon": "cash", "color": "success"},
+            {"label": "إجمالي البطاقة", "value": f"{card_total:,.2f}", "icon": "credit_card", "color": "primary"},
+            {"label": "حساب العميل", "value": f"{account_total:,.2f}", "icon": "users", "color": "tertiary"},
         ]
 
         # Monthly breakdown for chart
@@ -407,6 +435,18 @@ class PosReportsApi(models.Model):
         total_value = float(cr.fetchone()[0])
 
         cr.execute("""
+            SELECT COALESCE(SUM(sq.quantity * pt.list_price), 0)
+            FROM stock_quant sq
+            JOIN product_product pp ON pp.id = sq.product_id
+            JOIN product_template pt ON pt.id = pp.product_tmpl_id
+            JOIN stock_location sl ON sl.id = sq.location_id
+            WHERE sl.usage = 'internal'
+              AND sl.company_id IN %s
+        """, (tuple(_cids),))
+        total_sale_value = float(cr.fetchone()[0])
+        potential_profit = total_sale_value - total_value
+
+        cr.execute("""
             SELECT COUNT(*) FROM (
                 SELECT sq.product_id
                 FROM stock_quant sq
@@ -421,7 +461,8 @@ class PosReportsApi(models.Model):
 
         cr.execute("""
             SELECT pt.id, pt.name, COALESCE(SUM(sq.quantity), 0) as qty,
-                   COALESCE(SUM(sq.quantity * COALESCE((pp.standard_price->>%(company_id)s)::double precision, 0.0)), 0) as val
+                   COALESCE(SUM(sq.quantity * COALESCE((pp.standard_price->>%(company_id)s)::double precision, 0.0)), 0) as cost_val,
+                   COALESCE(SUM(sq.quantity * pt.list_price), 0) as sale_val
             FROM stock_quant sq
             JOIN product_product pp ON pp.id = sq.product_id
             JOIN product_template pt ON pt.id = pp.product_tmpl_id
@@ -429,7 +470,7 @@ class PosReportsApi(models.Model):
             WHERE sl.usage = 'internal'
               AND sl.company_id IN %(cids)s
             GROUP BY pt.id, pt.name
-            ORDER BY val DESC LIMIT 10
+            ORDER BY cost_val DESC LIMIT 10
         """, {'company_id': str(company.id), 'cids': tuple(_cids)})
         top_stock = cr.fetchall()
 
@@ -439,7 +480,9 @@ class PosReportsApi(models.Model):
 
         summary = [
             {"label": "إجمالي المنتجات", "value": str(total_products), "icon": "shopping_bag", "color": "primary"},
-            {"label": "قيمة المخزون", "value": f"{total_value:,.2f}", "icon": "account_balance_wallet", "color": "secondary"},
+            {"label": "قيمة المخزون (التكلفة)", "value": f"{total_value:,.2f}", "icon": "account_balance_wallet", "color": "tertiary"},
+            {"label": "قيمة المخزون (سعر البيع)", "value": f"{total_sale_value:,.2f}", "icon": "trending_up", "color": "primary"},
+            {"label": "الربح المحتمل", "value": f"{potential_profit:,.2f}", "icon": "payments", "color": "success" if potential_profit >= 0 else "error"},
             {"label": "منتجات منخفضة", "value": str(low_stock), "icon": "file_warning", "color": "error"},
         ]
 
@@ -447,7 +490,7 @@ class PosReportsApi(models.Model):
             "type": "bar",
             "labels": [product_name_map[r[0]] for r in top_stock],
             "datasets": [
-                {"label": "القيمة", "data": [float(r[3]) for r in top_stock]},
+                {"label": "القيمة (التكلفة)", "data": [float(r[3]) for r in top_stock]},
             ],
         }
 
@@ -457,9 +500,20 @@ class PosReportsApi(models.Model):
             "columns": [
                 {"key": "product", "label": "المنتج"},
                 {"key": "qty", "label": "الكمية", "type": "number"},
-                {"key": "value", "label": "القيمة", "type": "number"},
+                {"key": "cost_value", "label": "قيمة التكلفة", "type": "number"},
+                {"key": "sale_value", "label": "قيمة البيع", "type": "number"},
+                {"key": "profit", "label": "الربح المحتمل", "type": "number"},
             ],
-            "rows": [{"product": product_name_map[r[0]], "qty": float(r[2]), "value": float(r[3])} for r in top_stock],
+            "rows": [
+                {
+                    "product": product_name_map[r[0]],
+                    "qty": float(r[2]),
+                    "cost_value": float(r[3]),
+                    "sale_value": float(r[4]),
+                    "profit": float(r[4]) - float(r[3]),
+                }
+                for r in top_stock
+            ],
         }
 
     # ---------------------------------------------------------------
@@ -480,6 +534,7 @@ class PosReportsApi(models.Model):
             WHERE ss.date_done >= %s AND ss.date_done <= %s
               AND ss.company_id IN %s
             ORDER BY ss.date_done DESC
+            LIMIT 200
         """, (d_from, d_to, tuple(_cids)))
         scrap_rows = cr.fetchall()
 
@@ -792,6 +847,41 @@ class PosReportsApi(models.Model):
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
+        # Totals from ALL orders in date range
+        cr.execute("""
+            SELECT COUNT(*), COALESCE(SUM(po.amount_total), 0)
+            FROM pos_order po
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+        """, (dt_from, dt_to, tuple(_cids)))
+        row = cr.fetchone()
+        total_orders = row[0] or 0
+        total_amount = float(row[1] or 0.0)
+
+        # Payment totals by method type
+        cr.execute("""
+            SELECT CASE
+                WHEN pj.type = 'cash' THEN 'cash'
+                WHEN pj.type = 'bank' THEN 'bank'
+                ELSE 'pay_later'
+            END as payment_type,
+            COALESCE(SUM(pp.amount), 0)
+            FROM pos_payment pp
+            JOIN pos_order po ON po.id = pp.pos_order_id
+            JOIN pos_payment_method ppm ON ppm.id = pp.payment_method_id
+            LEFT JOIN account_journal pj ON pj.id = ppm.journal_id
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+            GROUP BY payment_type
+        """, (dt_from, dt_to, tuple(_cids)))
+        payment_totals = dict(cr.fetchall())
+        cash_total = payment_totals.get('cash', 0.0)
+        card_total = payment_totals.get('bank', 0.0)
+        account_total = payment_totals.get('pay_later', 0.0)
+
+        # Detail rows
         cr.execute("""
             SELECT po.name, COALESCE(rp.name, 'عميل نقدي') as partner,
                    po.date_order, po.amount_total, po.amount_tax, po.state,
@@ -807,12 +897,12 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         sale_rows = cr.fetchall()
 
-        total_amount = sum(r[3] for r in sale_rows) or 0.0
-        total_orders = len(sale_rows)
-
         summary = [
             {"label": "عدد الطلبات", "value": str(total_orders), "icon": "receipt", "color": "primary"},
             {"label": "إجمالي المبيعات", "value": f"{total_amount:,.2f}", "icon": "trending_up", "color": "secondary"},
+            {"label": "إجمالي النقدي", "value": f"{cash_total:,.2f}", "icon": "cash", "color": "success"},
+            {"label": "إجمالي البطاقة", "value": f"{card_total:,.2f}", "icon": "credit_card", "color": "primary"},
+            {"label": "حساب العميل", "value": f"{account_total:,.2f}", "icon": "users", "color": "tertiary"},
         ]
 
         columns = [
@@ -893,7 +983,7 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
 
         cr.execute("""
-            SELECT ps.name, pc.name as register, rp.name as user,
+            SELECT ps.id, ps.name, pc.name as register, rp.name as user,
                    ps.start_at, ps.stop_at, ps.state,
                    (SELECT COUNT(*) FROM pos_order po WHERE po.session_id = ps.id AND po.company_id IN %s) as order_count,
                    ps.cash_register_balance_end_real
@@ -909,10 +999,10 @@ class PosReportsApi(models.Model):
         session_rows = cr.fetchall()
 
         total_sessions = len(session_rows)
-        total_orders = sum(r[6] or 0 for r in session_rows)
+        total_orders = sum(r[7] or 0 for r in session_rows)
         state_counts = defaultdict(int)
         for r in session_rows:
-            state_counts[r[5]] += 1
+            state_counts[r[6]] += 1
 
         summary = [
             {"label": "إجمالي المناوبات", "value": str(total_sessions), "icon": "timer", "color": "primary"},
@@ -926,6 +1016,7 @@ class PosReportsApi(models.Model):
                         "closing_control": "bg-amber-100", "closed": "bg-slate-100"}
 
         columns = [
+            {"key": "session_id", "label": "المعرف"},
             {"key": "name", "label": "المناوبة"},
             {"key": "register", "label": "الجهاز"},
             {"key": "user", "label": "المستخدم"},
@@ -936,11 +1027,11 @@ class PosReportsApi(models.Model):
             {"key": "state", "label": "الحالة"},
         ]
         rows = [
-            {"name": r[0], "register": r[1], "user": r[2] or "",
-             "start": str(r[3] or ""), "stop": str(r[4] or ""),
-             "orders": r[6] or 0, "cash": float(r[7] or 0),
-             "state": state_map.get(r[5], r[5]),
-             "_state_color": state_colors.get(r[5], "")}
+            {"session_id": r[0], "name": r[1], "register": r[2], "user": r[3] or "",
+             "start": str(r[4] or ""), "stop": str(r[5] or ""),
+             "orders": r[7] or 0, "cash": float(r[8] or 0),
+             "state": state_map.get(r[6], r[6]),
+             "_state_color": state_colors.get(r[6], "")}
             for r in session_rows
         ]
 
@@ -1080,7 +1171,7 @@ class PosReportsApi(models.Model):
             ('payment_state', '!=', 'paid'),
             ('invoice_date_due', '<', today),
         ] + company_domain
-        bills = self.env['account.move'].search(bill_domain, order='invoice_date_due asc')
+        bills = self.env['account.move'].search(bill_domain, order='invoice_date_due asc', limit=200)
 
         bill_items = []
         for b in bills:
@@ -1106,7 +1197,7 @@ class PosReportsApi(models.Model):
             ('state', '=', 'purchase'),
             ('receipt_status', 'in', ('pending', 'partial')),
         ] + company_domain
-        pos = self.env['purchase.order'].search(po_domain, order='date_order asc')
+        pos = self.env['purchase.order'].search(po_domain, order='date_order asc', limit=200)
 
         po_items = []
         for po in pos:
@@ -1189,6 +1280,67 @@ class PosReportsApi(models.Model):
         return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
 
     # ---------------------------------------------------------------
+    # Open Sessions (for close-session dropdown)
+    # ---------------------------------------------------------------
+    @api.model
+    def _get_open_sessions(self, date_from=None, date_to=None, **kw):
+        _cids = self._get_allowed_companies()
+        try:
+            states = kw.get('states', 'opened,closing_control').split(',')
+            domain = [
+                ('state', 'in', states),
+                ('config_id.company_id', 'in', _cids),
+            ]
+            sessions = self.env['pos.session'].search(domain, order='name desc')
+            result = [{
+                "id": s.id,
+                "name": s.name,
+                "config": s.config_id.name,
+                "user": s.user_id.partner_id.name or s.user_id.name or "",
+                "state": s.state,
+                "start_at": str(s.start_at or ""),
+                "order_count": len(s.order_ids),
+                "total_sales": sum(s.order_ids.filtered(lambda o: o.state not in ('draft', 'cancel')).mapped('amount_total')),
+            } for s in sessions]
+            _logger.info(f"_get_open_sessions: found {len(result)} sessions for companies {_cids}")
+            return {"data": result}
+        except Exception as e:
+            _logger.error(f"_get_open_sessions error: {e}", exc_info=True)
+            return {"data": [], "error": str(e)}
+
+    # ---------------------------------------------------------------
+    # Close POS Session
+    # ---------------------------------------------------------------
+    @api.model
+    def _close_pos_session(self, date_from=None, date_to=None, **kw):
+        session_id = kw.get('session_id')
+        if not session_id:
+            return {"status": "error", "message": "معرف الجلسة مطلوب"}
+
+        if not self.env.user.has_group('point_of_sale.group_pos_manager'):
+            return {"status": "error", "message": "ليس لديك صلاحية إغلاق الجلسات"}
+
+        session = self.env['pos.session'].browse(int(session_id))
+        if not session.exists():
+            return {"status": "error", "message": "الجلسة غير موجودة"}
+        if session.state not in ('opened', 'closing_control'):
+            return {"status": "error", "message": "الجلسة ليست مفتوحة أو في طور الإغلاق"}
+
+        try:
+            session_sudo = session.sudo().with_company(session.company_id)
+            if session_sudo.state == 'opened':
+                session_sudo.write({'state': 'closing_control', 'stop_at': fields.Datetime.now()})
+                self.env.cr.flush()
+            if session_sudo.state == 'closing_control':
+                result = session_sudo._validate_session()
+                if isinstance(result, dict):
+                    return {"status": "error", "message": result.get('name', 'فشل التسوية المحاسبية')}
+            return {"status": "success", "message": f"تم إغلاق الجلسة {session.name} بنجاح"}
+        except Exception as e:
+            _logger.error(f"POS close session error: {e}", exc_info=True)
+            return {"status": "error", "message": f"فشل إغلاق الجلسة: {str(e)}"}
+
+    # ---------------------------------------------------------------
     # Main entry point
     # ---------------------------------------------------------------
     @api.model
@@ -1212,6 +1364,8 @@ class PosReportsApi(models.Model):
             "salesperson": "_report_salesperson",
             "activity_log": "_report_activity_log",
             "late_payments": "_report_late_payments",
+            "open_sessions": "_get_open_sessions",
+            "close_session": "_close_pos_session",
         }
         method_name = method_map.get(report_type)
         if not method_name:

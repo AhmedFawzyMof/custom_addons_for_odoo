@@ -74,6 +74,7 @@ class PurchaseOrderApi(models.AbstractModel):
                 'partner_id': [po.partner_id.id, po.partner_id.name] if po.partner_id else False,
                 'date_order': po.date_order.strftime('%Y-%m-%d') if po.date_order else '',
                 'amount_total': po.amount_total,
+                'amount_untaxed': po.amount_untaxed,
                 'state': po.state,
                 'receipt_status': receipt_status,
                 'order_line_count': len(po.order_line),
@@ -122,8 +123,8 @@ class PurchaseOrderApi(models.AbstractModel):
             for ml in p.move_line_ids:
                 move_lines.append({
                     'product_id': [ml.product_id.id, ml.product_id.display_name] if ml.product_id else False,
-                    'qty_done': ml.qty_done,
-                    'quantity': ml.quantity if hasattr(ml, 'quantity') else ml.qty_done,
+                    'qty_done': getattr(ml, 'qty_done', 0),
+                    'quantity': ml.quantity if hasattr(ml, 'quantity') else getattr(ml, 'qty_done', 0),
                 })
             pickings.append({
                 'id': p.id,
@@ -238,6 +239,104 @@ class PurchaseOrderApi(models.AbstractModel):
             }
         except Exception as e:
             return {'success': False, 'message': f'فشل في إنشاء أمر الشراء: {str(e)}'}
+
+    @api.model
+    def update_purchase_order(self, payload):
+        """Update a purchase order (draft only) with new header + lines."""
+        po_id = payload.get('po_id')
+        if not po_id:
+            return {'success': False, 'message': 'Purchase order ID required'}
+
+        po = self.env['purchase.order'].browse(int(po_id))
+        if not po.exists():
+            return {'success': False, 'message': 'Purchase order not found'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and po.company_id.id not in _cids:
+            return {'success': False, 'message': 'Purchase order not found in this company'}
+        if po.state not in ('draft', 'sent', 'purchase'):
+            return {'success': False, 'message': f'Cannot edit PO in state: {po.state}'}
+
+        try:
+            partner_id = payload.get('partner_id')
+            date_order = payload.get('date_order')
+            notes = payload.get('notes', '')
+            lines_data = payload.get('lines', [])
+            new_state = payload.get('state')
+            new_receipt_status = payload.get('receipt_status')
+
+            header_vals = {}
+            if partner_id:
+                header_vals['partner_id'] = int(partner_id)
+            if date_order:
+                header_vals['date_order'] = date_order
+            header_vals['notes'] = notes
+            if header_vals:
+                po.write(header_vals)
+
+            if lines_data:
+                existing_ids = set(po.order_line.ids)
+                sent_ids = set()
+                line_commands = []
+
+                for line in lines_data:
+                    product_id = line.get('product_id')
+                    if not product_id:
+                        continue
+                    quantity = float(line.get('quantity', 1))
+                    price_unit = float(line.get('price_unit', 0))
+                    name = line.get('name', '')
+                    tax_ids = line.get('tax_ids', [])
+
+                    product = self.env['product.product'].browse(int(product_id))
+                    if not name:
+                        name = product.display_name
+
+                    tax_command = [(6, 0, tax_ids)] if tax_ids else [(6, 0, product.supplier_taxes_id.ids)]
+
+                    line_vals = {
+                        'product_id': int(product_id),
+                        'name': name,
+                        'product_qty': quantity,
+                        'price_unit': price_unit,
+                        'product_uom': product.uom_po_id.id or product.uom_id.id,
+                        'taxes_id': tax_command,
+                        'date_planned': fields.Datetime.now(),
+                    }
+
+                    line_id = line.get('id')
+                    if line_id:
+                        sent_ids.add(int(line_id))
+                        line_commands.append((1, int(line_id), line_vals))
+                    else:
+                        line_commands.append((0, 0, line_vals))
+
+                to_remove = existing_ids - sent_ids
+                for lid in to_remove:
+                    line_commands.append((2, lid))
+
+                if line_commands:
+                    po.write({'order_line': line_commands})
+
+            if new_state and new_state != po.state:
+                if new_state == 'purchase' and po.state == 'draft':
+                    po.button_confirm()
+                elif new_state == 'cancel' and po.state != 'cancel':
+                    po.button_cancel()
+                elif new_state == 'draft' and po.state == 'cancel':
+                    po.write({'state': 'draft'})
+                elif new_state == 'sent':
+                    po.write({'state': 'sent'})
+                elif new_state == 'done':
+                    po.write({'state': 'done'})
+
+            return {
+                'success': True,
+                'po_id': po.id,
+                'name': po.name,
+                'message': 'تم تحديث أمر الشراء بنجاح',
+            }
+        except Exception as e:
+            return {'success': False, 'message': f'فشل تحديث أمر الشراء: {str(e)}'}
 
     @api.model
     def confirm_purchase_order(self, po_id):

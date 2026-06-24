@@ -25,8 +25,16 @@ class StockMoveLine(models.Model):
 
         search_query = params.get('search', '').strip()
         selected_type = params.get('type', 'all')
+        selected_usage = params.get('usage', '')
         date_from = params.get('dateFrom', '')
         date_to = params.get('dateTo', '')
+        product_id = params.get('productId', '')
+
+        if product_id:
+            try:
+                product_id = int(product_id)
+            except (ValueError, TypeError):
+                product_id = None
 
         # Base Domain: Always ensure the operation is validated and done
         domain = [('state', '=', 'done'), *self._get_company_domain()]
@@ -37,6 +45,10 @@ class StockMoveLine(models.Model):
             domain.append(('date', '>=', f"{date_from} 00:00:00"))
         if date_to:
             domain.append(('date', '<=', f"{date_to} 23:59:59"))
+
+        # B) Product Filter (product.template id → variant's product_tmpl_id)
+        if product_id:
+            domain.append(('product_id.product_tmpl_id', '=', product_id))
 
         if search_query:
             domain.extend([
@@ -53,6 +65,8 @@ class StockMoveLine(models.Model):
         for line in all_lines:
             src_name = line.location_id.complete_name or ''
             dest_name = line.location_dest_id.complete_name or ''
+            src_usage = line.location_id.usage or ''
+            dest_usage = line.location_dest_id.usage or ''
             
             # Support Odoo 16 (qty_done) and Odoo 17/18 (quantity)
             raw_qty = getattr(line, 'quantity', getattr(line, 'qty_done', 0))
@@ -79,6 +93,10 @@ class StockMoveLine(models.Model):
             if selected_type != 'all' and selected_type != move_type:
                 continue
 
+            # Usage-based filter (e.g. only internal-to-internal transfers)
+            if selected_usage == 'internal' and (src_usage != 'internal' or dest_usage != 'internal'):
+                continue
+
             # Datetime Localized Parsing
             dt_field = fields.Datetime.from_string(line.date)
             local_dt = fields.Datetime.context_timestamp(self, dt_field) if self.env.user else dt_field
@@ -93,11 +111,15 @@ class StockMoveLine(models.Model):
                 'typeLabel': direction,         # Arabic Label matching your style
                 'fromLocation': src_name,
                 'toLocation': dest_name,
+                'fromUsage': src_usage,
+                'toUsage': dest_usage,
                 'qty': calculated_qty,          # Evaluated number with positive/negative mathematical assignment
                 'operator': line.create_uid.name or 'النظام',
                 'status': 'done',
                 'statusLabel': 'مكتمل',
-                'badgeColor': badge_color       # Passes your custom styling strings down seamlessly
+                'badgeColor': badge_color,      # Passes your custom styling strings down seamlessly
+                'reference': line.reference or line.picking_id.name or '',
+                'notes': line.move_id.description_picking or ''
             })
 
         # 4. In-Memory Slice Pagination Engine
