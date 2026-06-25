@@ -113,6 +113,7 @@ class PurchaseOrderApi(models.AbstractModel):
                 'price_unit': line.price_unit,
                 'price_subtotal': line.price_subtotal,
                 'price_total': line.price_total,
+                'list_price': line.list_price,
                 'date_planned': line.date_planned.strftime('%Y-%m-%d') if line.date_planned else '',
                 'tax_ids': [{'id': t.id, 'name': t.name} for t in line.taxes_id],
             })
@@ -188,6 +189,7 @@ class PurchaseOrderApi(models.AbstractModel):
             product_id = line.get('product_id')
             quantity = float(line.get('quantity', 1))
             price_unit = float(line.get('price_unit', 0))
+            list_price = float(line.get('list_price', 0))
 
             if not product_id:
                 continue
@@ -205,6 +207,7 @@ class PurchaseOrderApi(models.AbstractModel):
                 'product_uom': product.uom_po_id.id or product.uom_id.id,
                 'taxes_id': tax_ids if isinstance(tax_ids, list) else [(6, 0, tax_ids)],
                 'date_planned': fields.Datetime.now(),
+                'list_price': list_price,
             }))
 
         picking_type = self.env['stock.picking.type'].search([
@@ -284,6 +287,7 @@ class PurchaseOrderApi(models.AbstractModel):
                         continue
                     quantity = float(line.get('quantity', 1))
                     price_unit = float(line.get('price_unit', 0))
+                    list_price = float(line.get('list_price', 0))
                     name = line.get('name', '')
                     tax_ids = line.get('tax_ids', [])
 
@@ -301,6 +305,7 @@ class PurchaseOrderApi(models.AbstractModel):
                         'product_uom': product.uom_po_id.id or product.uom_id.id,
                         'taxes_id': tax_command,
                         'date_planned': fields.Datetime.now(),
+                        'list_price': list_price,
                     }
 
                     line_id = line.get('id')
@@ -316,6 +321,16 @@ class PurchaseOrderApi(models.AbstractModel):
 
                 if line_commands:
                     po.write({'order_line': line_commands})
+
+                for line in lines_data:
+                    product_id = line.get('product_id')
+                    if not product_id:
+                        continue
+                    product = self.env['product.product'].browse(int(product_id))
+                    product.write({
+                        'standard_price': float(line.get('price_unit', 0)),
+                        'list_price': float(line.get('list_price', 0)),
+                    })
 
             if new_state and new_state != po.state:
                 if new_state == 'purchase' and po.state == 'draft':
@@ -352,6 +367,13 @@ class PurchaseOrderApi(models.AbstractModel):
 
         try:
             po.button_confirm()
+
+            for line in po.order_line:
+                line.product_id.write({
+                    'standard_price': line.price_unit,
+                    'list_price': line.list_price,
+                })
+
             return {
                 'success': True,
                 'po_id': po.id,
