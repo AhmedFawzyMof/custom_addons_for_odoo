@@ -116,6 +116,12 @@ class PurchaseOrderApi(models.AbstractModel):
                 'list_price': line.list_price,
                 'date_planned': line.date_planned.strftime('%Y-%m-%d') if line.date_planned else '',
                 'tax_ids': [{'id': t.id, 'name': t.name} for t in line.taxes_id],
+                'location_allocations': [{
+                    'id': a.id,
+                    'location_id': a.location_id.id,
+                    'location_name': a.location_id.name,
+                    'quantity': a.quantity,
+                } for a in line.location_allocations],
             })
 
         pickings = []
@@ -185,6 +191,7 @@ class PurchaseOrderApi(models.AbstractModel):
             return {'success': False, 'message': 'At least one line is required'}
 
         order_lines = []
+        active_lines_data = []
         for line in lines_data:
             product_id = line.get('product_id')
             quantity = float(line.get('quantity', 1))
@@ -209,6 +216,7 @@ class PurchaseOrderApi(models.AbstractModel):
                 'date_planned': fields.Datetime.now(),
                 'list_price': list_price,
             }))
+            active_lines_data.append(line)
 
         picking_type = self.env['stock.picking.type'].search([
             ('code', '=', 'incoming'),
@@ -234,6 +242,15 @@ class PurchaseOrderApi(models.AbstractModel):
 
         try:
             po = self.env['purchase.order'].create(vals)
+
+            for line_data, po_line in zip(active_lines_data, po.order_line):
+                for alloc in line_data.get('location_allocations', []):
+                    self.env['purchase.order.line.location'].create({
+                        'line_id': po_line.id,
+                        'location_id': alloc['location_id'],
+                        'quantity': alloc['quantity'],
+                    })
+
             return {
                 'success': True,
                 'po_id': po.id,
@@ -331,6 +348,20 @@ class PurchaseOrderApi(models.AbstractModel):
                         'standard_price': float(line.get('price_unit', 0)),
                         'list_price': float(line.get('list_price', 0)),
                     })
+
+                    po_line_id = int(line.get('id')) if line.get('id') else None
+                    po_line = self.env['purchase.order.line'].browse(po_line_id) if po_line_id else po.order_line.filtered(
+                        lambda l: l.product_id.id == int(product_id)
+                    )[:1]
+                    if po_line:
+                        allocations_data = line.get('location_allocations', [])
+                        po_line.location_allocations.unlink()
+                        for alloc in allocations_data:
+                            self.env['purchase.order.line.location'].create({
+                                'line_id': po_line.id,
+                                'location_id': alloc['location_id'],
+                                'quantity': alloc['quantity'],
+                            })
 
             if new_state and new_state != po.state:
                 if new_state == 'purchase' and po.state == 'draft':
@@ -459,6 +490,29 @@ class PurchaseOrderApi(models.AbstractModel):
                 _logger.info(
                     "  LINE %s: qty_received=%s qty_to_invoice=%s qty_invoiced=%s",
                     line.id, line.qty_received, line.qty_to_invoice, line.qty_invoiced)
+
+            for line in po.order_line:
+                if not line.location_allocations:
+                    continue
+                for alloc in line.location_allocations:
+                    if alloc.quantity <= 0:
+                        continue
+                    product = line.product_id
+                    location = alloc.location_id
+                    quants = self.env['stock.quant'].search([
+                        ('product_id', '=', product.id),
+                        ('location_id', '=', location.id),
+                    ])
+                    if quants:
+                        quants[0].inventory_quantity = quants[0].quantity + alloc.quantity
+                        quants[0].action_apply_inventory()
+                    else:
+                        new_quant = self.env['stock.quant'].create({
+                            'product_id': product.id,
+                            'location_id': location.id,
+                            'inventory_quantity': alloc.quantity,
+                        })
+                        new_quant.action_apply_inventory()
 
             receipt_status_raw = po.receipt_status
             receipt_status_map = {'full': 'done', 'partial': 'partial'}

@@ -10,3 +10,10 @@ class PurchaseOrderLine(models.Model):
         default=0.0,
         help="Selling price set at the time of purchase. This will update the product's list_price upon PO confirmation.",
     )
+
+    location_allocations = fields.One2many(
+        'purchase.order.line.location',
+        'line_id',
+        string='Location Allocations',
+        help="Storage locations and quantities for distributing received stock.",
+    )
