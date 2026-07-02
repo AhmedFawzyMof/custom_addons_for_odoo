@@ -11,6 +11,12 @@ _logger = logging.getLogger(__name__)
 class PosConfig(models.Model):
     _inherit = 'pos.config'
 
+    allow_out_of_stock_sale = fields.Boolean(
+        string='Allow Sale of Out-of-Stock Products',
+        default=False,
+        help='If enabled, products with zero or negative stock can be sold in POS'
+    )
+
     def _get_company_domain(self):
         """Return company filter domain from context, or empty."""
         cids = self.env.context.get('allowed_company_ids', [])
@@ -215,10 +221,10 @@ class PosConfig(models.Model):
 
         available_product_ids = []
         if has_location_filter:
-            quant_records = self.env['stock.quant'].search([
-                ('location_id', '=', location_ids[0]),
-                ('quantity', '>', 0.0)
-            ])
+            quant_domain = [('location_id', '=', location_ids[0])]
+            if not pos_config.allow_out_of_stock_sale:
+                quant_domain.append(('quantity', '>', 0.0))
+            quant_records = self.env['stock.quant'].search(quant_domain)
             available_product_ids = list(set(quant_records.mapped('product_id.id')))
             product_domain.append(('id', 'in', available_product_ids))
 
@@ -311,6 +317,9 @@ class PosConfig(models.Model):
                     'value_name': ptav.name,
                 })
 
+            image_data = prod.image_1920
+            image_base64 = image_data if isinstance(image_data, str) else (image_data.decode('utf-8') if image_data else None)
+
             product_list.append({
                 'id':               prod.id,
                 'product_tmpl_id':  prod.product_tmpl_id.id,
@@ -326,6 +335,7 @@ class PosConfig(models.Model):
                 'attribute_values': attribute_values,
                 'attribute_lines':  template_attr_map.get(prod.product_tmpl_id.id, []),
                 'price_extra':      sum(ptav.price_extra for ptav in prod.product_template_attribute_value_ids),
+                'image_1920':       image_base64,
             })
 
         total_pages = (total_products + limit - 1) // limit
@@ -339,6 +349,7 @@ class PosConfig(models.Model):
                 'pricelists':           pricelists,
                 'payment_methods':      payment_methods,
                 'default_pricelist_id': pos_config.pricelist_id.id,
+                'allow_out_of_stock_sale': pos_config.allow_out_of_stock_sale,
                 'pagination': {
                     'total_items':  total_products,
                     'total_pages':  total_pages,

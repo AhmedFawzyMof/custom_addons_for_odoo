@@ -111,9 +111,9 @@ class PurchaseOrderApi(models.AbstractModel):
                 'qty_received': line.qty_received,
                 'qty_invoiced': line.qty_invoiced,
                 'price_unit': line.price_unit,
+                'list_price': line.product_id.list_price if line.product_id else 0.0,
                 'price_subtotal': line.price_subtotal,
                 'price_total': line.price_total,
-                'list_price': line.list_price,
                 'date_planned': line.date_planned.strftime('%Y-%m-%d') if line.date_planned else '',
                 'tax_ids': [{'id': t.id, 'name': t.name} for t in line.taxes_id],
                 'location_allocations': [{
@@ -196,8 +196,6 @@ class PurchaseOrderApi(models.AbstractModel):
             product_id = line.get('product_id')
             quantity = float(line.get('quantity', 1))
             price_unit = float(line.get('price_unit', 0))
-            list_price = float(line.get('list_price', 0))
-
             if not product_id:
                 continue
 
@@ -214,7 +212,6 @@ class PurchaseOrderApi(models.AbstractModel):
                 'product_uom': product.uom_po_id.id or product.uom_id.id,
                 'taxes_id': tax_ids if isinstance(tax_ids, list) else [(6, 0, tax_ids)],
                 'date_planned': fields.Datetime.now(),
-                'list_price': list_price,
             }))
             active_lines_data.append(line)
 
@@ -322,7 +319,6 @@ class PurchaseOrderApi(models.AbstractModel):
                         'product_uom': product.uom_po_id.id or product.uom_id.id,
                         'taxes_id': tax_command,
                         'date_planned': fields.Datetime.now(),
-                        'list_price': list_price,
                     }
 
                     line_id = line.get('id')
@@ -402,7 +398,7 @@ class PurchaseOrderApi(models.AbstractModel):
             for line in po.order_line:
                 line.product_id.write({
                     'standard_price': line.price_unit,
-                    'list_price': line.list_price,
+                    'list_price': line.product_id.list_price,
                 })
 
             return {
@@ -492,25 +488,35 @@ class PurchaseOrderApi(models.AbstractModel):
                     line.id, line.qty_received, line.qty_to_invoice, line.qty_invoiced)
 
             for line in po.order_line:
-                if not line.location_allocations:
+                product = line.product_id
+                allocs_from_payload = []
+                if lines_data:
+                    for ld in lines_data:
+                        pid = ld.get('product_id')
+                        if pid and int(pid) == product.id:
+                            allocs_from_payload = ld.get('location_allocations', [])
+                            break
+                allocs = allocs_from_payload if allocs_from_payload else line.location_allocations
+                if not allocs:
                     continue
-                for alloc in line.location_allocations:
-                    if alloc.quantity <= 0:
+                for alloc in allocs:
+                    qty = float(alloc.get('quantity', 0)) if isinstance(alloc, dict) else alloc.quantity
+                    if qty <= 0:
                         continue
-                    product = line.product_id
-                    location = alloc.location_id
+                    loc_id = int(alloc.get('location_id')) if isinstance(alloc, dict) else alloc.location_id.id
+                    location = self.env['stock.location'].browse(loc_id)
                     quants = self.env['stock.quant'].search([
                         ('product_id', '=', product.id),
                         ('location_id', '=', location.id),
                     ])
                     if quants:
-                        quants[0].inventory_quantity = quants[0].quantity + alloc.quantity
+                        quants[0].inventory_quantity = quants[0].quantity + qty
                         quants[0].action_apply_inventory()
                     else:
                         new_quant = self.env['stock.quant'].create({
                             'product_id': product.id,
                             'location_id': location.id,
-                            'inventory_quantity': alloc.quantity,
+                            'inventory_quantity': qty,
                         })
                         new_quant.action_apply_inventory()
 

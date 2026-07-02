@@ -418,12 +418,21 @@ class PosReportsApi(models.Model):
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
 
+        location_id = kw.get('location_id')
+        location_filter = ""
+        if location_id:
+            location_id = int(location_id)
+            location_filter = " AND sl.id = %(location_id)s"
+
         cr.execute("""
             SELECT COUNT(*) FROM product_product WHERE active = True
         """)
         total_products = cr.fetchone()[0] or 0
 
         company = self.env.company
+        params1 = {'company_id': str(company.id), 'cids': tuple(_cids)}
+        if location_id:
+            params1['location_id'] = location_id
         cr.execute("""
             SELECT COALESCE(SUM(sq.quantity * COALESCE((pp.standard_price->>%(company_id)s)::double precision, 0.0)), 0)
             FROM stock_quant sq
@@ -431,9 +440,13 @@ class PosReportsApi(models.Model):
             JOIN stock_location sl ON sl.id = sq.location_id
             WHERE sl.usage = 'internal'
               AND sl.company_id IN %(cids)s
-        """, {'company_id': str(company.id), 'cids': tuple(_cids)})
+              {location_filter}
+        """.format(location_filter=location_filter), params1)
         total_value = float(cr.fetchone()[0])
 
+        params2 = {'cids': tuple(_cids)}
+        if location_id:
+            params2['location_id'] = location_id
         cr.execute("""
             SELECT COALESCE(SUM(sq.quantity * pt.list_price), 0)
             FROM stock_quant sq
@@ -441,24 +454,32 @@ class PosReportsApi(models.Model):
             JOIN product_template pt ON pt.id = pp.product_tmpl_id
             JOIN stock_location sl ON sl.id = sq.location_id
             WHERE sl.usage = 'internal'
-              AND sl.company_id IN %s
-        """, (tuple(_cids),))
+              AND sl.company_id IN %(cids)s
+              {location_filter}
+        """.format(location_filter=location_filter), params2)
         total_sale_value = float(cr.fetchone()[0])
         potential_profit = total_sale_value - total_value
 
+        params3 = {'cids': tuple(_cids)}
+        if location_id:
+            params3['location_id'] = location_id
         cr.execute("""
             SELECT COUNT(*) FROM (
                 SELECT sq.product_id
                 FROM stock_quant sq
                 JOIN stock_location sl ON sl.id = sq.location_id
                 WHERE sl.usage = 'internal'
-                  AND sl.company_id IN %s
+                  AND sl.company_id IN %(cids)s
+                  {location_filter}
                 GROUP BY sq.product_id
                 HAVING SUM(sq.quantity) <= 5 AND SUM(sq.quantity) > 0
             ) sub
-        """, (tuple(_cids),))
+        """.format(location_filter=location_filter), params3)
         low_stock = cr.fetchone()[0] or 0
 
+        params4 = {'company_id': str(company.id), 'cids': tuple(_cids)}
+        if location_id:
+            params4['location_id'] = location_id
         cr.execute("""
             SELECT pt.id, pt.name, COALESCE(SUM(sq.quantity), 0) as qty,
                    COALESCE(SUM(sq.quantity * COALESCE((pp.standard_price->>%(company_id)s)::double precision, 0.0)), 0) as cost_val,
@@ -469,9 +490,10 @@ class PosReportsApi(models.Model):
             JOIN stock_location sl ON sl.id = sq.location_id
             WHERE sl.usage = 'internal'
               AND sl.company_id IN %(cids)s
+              {location_filter}
             GROUP BY pt.id, pt.name
             ORDER BY cost_val DESC LIMIT 10
-        """, {'company_id': str(company.id), 'cids': tuple(_cids)})
+        """.format(location_filter=location_filter), params4)
         top_stock = cr.fetchall()
 
         product_tmpl_ids = [r[0] for r in top_stock]
@@ -629,6 +651,14 @@ class PosReportsApi(models.Model):
         _cids = self._get_allowed_companies()
         cr = self.env.cr
 
+        location_id = kw.get('location_id')
+        location_filter = ""
+        params = {'cids': tuple(_cids)}
+        if location_id:
+            location_id = int(location_id)
+            location_filter = " AND sl.id = %(location_id)s"
+            params['location_id'] = location_id
+
         cr.execute(r"""
             SELECT pt.id, pt.name, pp.default_code, pt.list_price,
                    COALESCE(sq.total_qty, 0) as qty_available,
@@ -645,13 +675,14 @@ class PosReportsApi(models.Model):
                 FROM stock_quant sq
                 JOIN stock_location sl ON sl.id = sq.location_id
                 WHERE sl.usage = 'internal'
-                  AND sl.company_id IN %s
+                  AND sl.company_id IN %(cids)s
+                  {location_filter}
                 GROUP BY product_id
             ) sq ON sq.product_id = pp.id
             WHERE pp.active = True
             ORDER BY pt.name
             LIMIT 200
-        """, (tuple(_cids),))
+        """.format(location_filter=location_filter), params)
         item_rows = cr.fetchall()
 
         product_tmpl_ids = list({r[0] for r in item_rows})

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_pos_config_inherit_out_of_stock_sale" model="ir.ui.view">
+        <field name="name">pos.config.inherit.out.of.stock.sale</field>
+        <field name="model">pos.config</field>
+        <field name="inherit_id" ref="point_of_sale.pos_config_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//setting[@id='other_devices']" position="after">
+                <setting string="Allow Out-of-Stock Sale" help="Allow products with zero or negative stock to be sold in POS">
+                    <field name="allow_out_of_stock_sale"/>
+                </setting>
+            </xpath>
+        </field>
+    </record>
+</odoo>

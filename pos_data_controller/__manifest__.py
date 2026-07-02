@@ -6,7 +6,9 @@
         'point_of_sale', 
         'stock'
     ],
-    'data': [], # Leave this empty if you only have the Python RPC logic
+    'data': [
+        'views/pos_config_views.xml',
+    ],
     'installable': True,
     'application': False,
 }
