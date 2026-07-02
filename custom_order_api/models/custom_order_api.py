@@ -74,7 +74,7 @@ class CustomOrderApi(models.AbstractModel):
             orders_data.append({
                 'id': order.id,
                 'name': order.pos_reference or order.name,
-                'date_order': order.date_order.isoformat() if order.date_order else None,
+                'date_order': order.date_order.isoformat() if order.date_order else False,
                 'state': order.state,
                 'partner_id': [order.partner_id.id, order.partner_id.name] if order.partner_id else False,
                 'user_id': [order.user_id.id, order.user_id.name] if order.user_id else False,
@@ -127,7 +127,7 @@ class CustomOrderApi(models.AbstractModel):
             'id': pay.id,
             'payment_method_id': [pay.payment_method_id.id, pay.payment_method_id.name] if pay.payment_method_id else False,
             'amount': pay.amount,
-            'payment_date': pay.payment_date.isoformat() if pay.payment_date else None,
+            'payment_date': pay.payment_date.isoformat() if pay.payment_date else False,
             'payment_status': order.state, # ترث الدفعة حالة ترحيل الطلب الأساسي في الـ POS (paid, done)
         } for pay in order.payment_ids]
 
@@ -153,7 +153,7 @@ class CustomOrderApi(models.AbstractModel):
         return {
             'id': order.id,
             'name': order.pos_reference or order.name,
-            'date_order': order.date_order.isoformat() if order.date_order else None,
+            'date_order': order.date_order.isoformat() if order.date_order else False,
             'state': order.state,
             'partner_id': [order.partner_id.id, order.partner_id.name] if order.partner_id else False,
             'user_id': [order.user_id.id, order.user_id.name] if order.user_id else False,
