@@ -217,3 +217,23 @@ class WarehouseLocation(models.AbstractModel):
             'total_pages': total_pages,
             'products': result_products
         }
+
+    @api.model
+    def delete_location(self, location_id):
+        location = self.env['stock.location'].browse(int(location_id))
+        if not location.exists():
+            return {'success': False, 'message': 'الموقع غير موجود'}
+
+        quants = self.env['stock.quant'].search([
+            ('location_id', '=', location.id),
+        ])
+        total_qty = sum(quant.quantity for quant in quants)
+        if total_qty > 0:
+            return {'success': False, 'message': 'لا يمكن حذف الموقع لأنه يحتوي على مخزون'}
+
+        children = self.env['stock.location'].search([('location_id', '=', location.id)])
+        if children:
+            return {'success': False, 'message': 'لا يمكن حذف الموقع لأنه يحتوي على مواقع فرعية'}
+
+        location.unlink()
+        return {'success': True, 'message': 'تم حذف الموقع بنجاح'}

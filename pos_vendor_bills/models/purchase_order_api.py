@@ -464,7 +464,36 @@ class PurchaseOrderApi(models.AbstractModel):
                             if pid and int(pid) == move.product_id.id:
                                 qty_to_receive = float(ld.get('qty_received', ld.get('quantity', qty_to_receive)))
                                 break
+
                     move.quantity = qty_to_receive
+
+                    allocs_from_payload = []
+                    if lines_data:
+                        for ld in lines_data:
+                            pid = ld.get('product_id')
+                            if pid and int(pid) == move.product_id.id:
+                                allocs_from_payload = ld.get('location_allocations', [])
+                                break
+                    line = move.purchase_line_id
+                    allocs = allocs_from_payload if allocs_from_payload else (line.location_allocations if line else [])
+                    if allocs:
+                        single = allocs[0] if isinstance(allocs[0], dict) else allocs[:1]
+                        if len(allocs) == 1:
+                            loc_id = int(allocs[0].get('location_id')) if isinstance(allocs[0], dict) else allocs[0].location_id.id
+                            move.location_dest_id = loc_id
+                        elif len(allocs) > 1:
+                            sorted_allocs = sorted(allocs, key=lambda a: a.get('quantity', 0) if isinstance(a, dict) else a.quantity, reverse=True)
+                            for alloc in sorted_allocs[1:]:
+                                alloc_qty = float(alloc.get('quantity', 0)) if isinstance(alloc, dict) else alloc.quantity
+                                if alloc_qty <= 0:
+                                    continue
+                                new_move = move._split(move.product_uom_qty - alloc_qty)
+                                if new_move:
+                                    loc_id = int(alloc.get('location_id')) if isinstance(alloc, dict) else alloc.location_id.id
+                                    new_move.location_dest_id = loc_id
+                                    new_move._action_confirm()._action_assign()
+                            first_loc_id = int(sorted_allocs[0].get('location_id')) if isinstance(sorted_allocs[0], dict) else sorted_allocs[0].location_id.id
+                            move.location_dest_id = first_loc_id
 
                 if picking.state != 'done':
                     picking.with_context(cancel_backorder=True)._action_done()
@@ -486,39 +515,6 @@ class PurchaseOrderApi(models.AbstractModel):
                 _logger.info(
                     "  LINE %s: qty_received=%s qty_to_invoice=%s qty_invoiced=%s",
                     line.id, line.qty_received, line.qty_to_invoice, line.qty_invoiced)
-
-            for line in po.order_line:
-                product = line.product_id
-                allocs_from_payload = []
-                if lines_data:
-                    for ld in lines_data:
-                        pid = ld.get('product_id')
-                        if pid and int(pid) == product.id:
-                            allocs_from_payload = ld.get('location_allocations', [])
-                            break
-                allocs = allocs_from_payload if allocs_from_payload else line.location_allocations
-                if not allocs:
-                    continue
-                for alloc in allocs:
-                    qty = float(alloc.get('quantity', 0)) if isinstance(alloc, dict) else alloc.quantity
-                    if qty <= 0:
-                        continue
-                    loc_id = int(alloc.get('location_id')) if isinstance(alloc, dict) else alloc.location_id.id
-                    location = self.env['stock.location'].browse(loc_id)
-                    quants = self.env['stock.quant'].search([
-                        ('product_id', '=', product.id),
-                        ('location_id', '=', location.id),
-                    ])
-                    if quants:
-                        quants[0].inventory_quantity = quants[0].quantity + qty
-                        quants[0].action_apply_inventory()
-                    else:
-                        new_quant = self.env['stock.quant'].create({
-                            'product_id': product.id,
-                            'location_id': location.id,
-                            'inventory_quantity': qty,
-                        })
-                        new_quant.action_apply_inventory()
 
             receipt_status_raw = po.receipt_status
             receipt_status_map = {'full': 'done', 'partial': 'partial'}
