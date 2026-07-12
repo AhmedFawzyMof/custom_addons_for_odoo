@@ -596,6 +596,66 @@ class PurchaseOrderApi(models.AbstractModel):
             return {'success': False, 'message': f'فشل في إنشاء الفاتورة: {str(e)}'}
 
     @api.model
+    def reverse_receive_purchase_order(self, payload):
+        """Reverse receive for a purchase order — creates return stock moves
+        and resets qty_received so the PO can be received again or cancelled."""
+        po_id = payload.get('po_id')
+        if not po_id:
+            return {'success': False, 'message': 'معرف أمر الشراء مطلوب'}
+
+        po = self.env['purchase.order'].browse(int(po_id))
+        if not po.exists():
+            return {'success': False, 'message': 'أمر الشراء غير موجود'}
+        _cids = self.env.context.get('allowed_company_ids', [])
+        if _cids and po.company_id.id not in _cids:
+            return {'success': False, 'message': 'أمر الشراء غير موجود في هذه الشركة'}
+
+        if po.receipt_status == 'pending':
+            return {'success': False, 'message': 'لم يتم استلام أي منتجات بعد لعكسها'}
+
+        done_pickings = po.picking_ids.filtered(lambda p: p.state == 'done')
+        if not done_pickings:
+            return {'success': False, 'message': 'لا توجد حركات استلام مكتملة لعكسها'}
+
+        bills = po.invoice_ids.filtered(lambda b: b.state != 'cancel')
+        has_bills = len(bills) > 0
+
+        try:
+            for picking in done_pickings:
+                wizard = self.env['stock.return.picking'].create({
+                    'picking_id': picking.id,
+                })
+                for return_line in wizard.product_return_moves:
+                    return_line.quantity = return_line.move_id.quantity
+                return_picking = wizard._create_return()
+                if return_picking:
+                    for move in return_picking.move_ids:
+                        move.quantity = move.product_uom_qty
+                        move.picked = True
+                    return_picking.with_context(cancel_backorder=True)._action_done()
+
+            for line in po.order_line:
+                line.qty_received = 0
+
+            po.invalidate_model(['receipt_status'])
+
+            result = {
+                'success': True,
+                'message': 'تم عكس استلام المنتجات بنجاح',
+            }
+            if has_bills:
+                bill_names = ', '.join(bills.mapped('name'))
+                result['bill_warning'] = (
+                    f'يوجد فاتورة مورد ({bill_names}) مرتبطة بأمر الشراء. '
+                    f'يرجى مراجعة الفاتورة وإلغاؤها إذا لزم الأمر.'
+                )
+
+            return result
+        except Exception as e:
+            _logger.exception("فشل عكس استلام أمر الشراء %s", po_id)
+            return {'success': False, 'message': f'فشل في عكس الاستلام: {str(e)}'}
+
+    @api.model
     def fix_missing_invoice_dates(self):
         """Backfill missing invoice_date on vendor bills created from POs."""
         bills = self.env['account.move'].search([
