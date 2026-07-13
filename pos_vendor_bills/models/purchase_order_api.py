@@ -395,6 +395,14 @@ class PurchaseOrderApi(models.AbstractModel):
         try:
             po.button_confirm()
 
+            # Bypass intermediate warehouse steps for POS receipts
+            for picking in po.picking_ids:
+                wh = picking.picking_type_id.warehouse_id
+                if wh and wh.reception_steps != 'one_step':
+                    for move in picking.move_ids:
+                        if move.location_dest_id == wh.wh_input_stock_loc_id:
+                            move.location_dest_id = wh.lot_stock_id.id
+
             for line in po.order_line:
                 line.product_id.write({
                     'standard_price': line.price_unit,
@@ -466,6 +474,7 @@ class PurchaseOrderApi(models.AbstractModel):
                                 break
 
                     move.quantity = qty_to_receive
+                    move.picked = True
 
                     allocs_from_payload = []
                     if lines_data:
@@ -494,8 +503,12 @@ class PurchaseOrderApi(models.AbstractModel):
                                     new_move._action_confirm()._action_assign()
                             first_loc_id = int(sorted_allocs[0].get('location_id')) if isinstance(sorted_allocs[0], dict) else sorted_allocs[0].location_id.id
                             move.location_dest_id = first_loc_id
-
                 if picking.state != 'done':
+                    wh = picking.picking_type_id.warehouse_id
+                    if wh and wh.reception_steps != 'one_step':
+                        for move in picking.move_ids.filtered(lambda m: m.state not in ('done', 'cancel')):
+                            if move.location_dest_id == wh.wh_input_stock_loc_id:
+                                move.location_dest_id = wh.lot_stock_id.id
                     picking.with_context(cancel_backorder=True)._action_done()
 
             for line in po.order_line:
@@ -597,8 +610,9 @@ class PurchaseOrderApi(models.AbstractModel):
 
     @api.model
     def reverse_receive_purchase_order(self, payload):
-        """Reverse receive for a purchase order — creates return stock moves
-        and resets qty_received so the PO can be received again or cancelled."""
+        """Reverse receive for a purchase order — creates return stock moves,
+        resets qty_received so the PO can be received again or cancelled,
+        and handles linked vendor bills (draft → auto-cancel, posted → warning)."""
         po_id = payload.get('po_id')
         if not po_id:
             return {'success': False, 'message': 'معرف أمر الشراء مطلوب'}
@@ -617,9 +631,6 @@ class PurchaseOrderApi(models.AbstractModel):
         if not done_pickings:
             return {'success': False, 'message': 'لا توجد حركات استلام مكتملة لعكسها'}
 
-        bills = po.invoice_ids.filtered(lambda b: b.state != 'cancel')
-        has_bills = len(bills) > 0
-
         try:
             for picking in done_pickings:
                 wizard = self.env['stock.return.picking'].create({
@@ -637,19 +648,37 @@ class PurchaseOrderApi(models.AbstractModel):
             for line in po.order_line:
                 line.qty_received = 0
 
-            po.invalidate_model(['receipt_status'])
+            # Handle linked vendor bills — draft: auto-cancel, posted: warn
+            bills = po.invoice_ids.filtered(lambda b: b.state != 'cancel')
+            cancelled_draft_names = []
+            posted_bill_names = []
+
+            for bill in bills:
+                if bill.state == 'draft':
+                    bill.button_cancel()
+                    cancelled_draft_names.append(bill.display_name or f'Bill #{bill.id}')
+                elif bill.state == 'posted':
+                    posted_bill_names.append(bill.display_name or f'Bill #{bill.id}')
+
+            # Force receipt_status to 'pending' — the computed field only looks
+            # at picking_ids.state (all done after return), not at qty_received
+            po.write({'receipt_status': False})
+            po.flush_recordset(['receipt_status', 'state'])
+
+            message = 'تم عكس استلام المنتجات بنجاح.'
+            if cancelled_draft_names:
+                message += f' تم إلغاء فواتير المسودة تلقائياً: ({", ".join(cancelled_draft_names)}).'
 
             result = {
                 'success': True,
-                'message': 'تم عكس استلام المنتجات بنجاح',
+                'message': message,
+                'receipt_status': 'pending',
             }
-            if has_bills:
-                bill_names = ', '.join(bills.mapped('name'))
+            if posted_bill_names:
                 result['bill_warning'] = (
-                    f'يوجد فاتورة مورد ({bill_names}) مرتبطة بأمر الشراء. '
-                    f'يرجى مراجعة الفاتورة وإلغاؤها إذا لزم الأمر.'
+                    f'تنبيه: يوجد فواتير مرحّلة (Posted) بحاجة لمراجعة وإلغاء يدوي '
+                    f'أو عمل إشعار دائن: ({", ".join(posted_bill_names)})'
                 )
-
             return result
         except Exception as e:
             _logger.exception("فشل عكس استلام أمر الشراء %s", po_id)

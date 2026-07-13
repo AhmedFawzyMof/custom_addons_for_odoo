@@ -1,5 +1,9 @@
+import logging
+
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 
 class VendorBillApi(models.AbstractModel):
@@ -14,8 +18,8 @@ class VendorBillApi(models.AbstractModel):
 
     def _ensure_invoice_taxes(self, bill):
         """Fill missing taxes on invoice lines to pass account_invoice_tax_required validation."""
-        line_domain = lambda l: l.display_type not in ('line_section', 'line_note') and not l.tax_ids
-        for line in bill.invoice_line_ids.filtered(line_domain):
+        excluded_types = {'line_section', 'line_note', 'tax', 'payment_term', 'rounding', 'discount', 'cogs', 'epd'}
+        for line in bill.line_ids.filtered(lambda l: l.display_type not in excluded_types and not l.tax_ids):
             tax_ids = False
             if line.product_id and line.product_id.supplier_taxes_id:
                 tax_ids = line.product_id.supplier_taxes_id.ids
@@ -122,9 +126,28 @@ class VendorBillApi(models.AbstractModel):
         if _cids and bill.company_id.id not in _cids:
             return {'success': False, 'message': 'Vendor bill not found in this company'}
 
-        # Invoice lines
+        # Invoice lines — iterate over line_ids instead of invoice_line_ids
+        # to avoid missing lines whose display_type may not match the field's
+        # domain filter [('display_type', 'in', ('product', 'line_section', 'line_note'))].
+        NON_INVOICE_DISPLAY_TYPES = {'tax', 'payment_term', 'rounding', 'discount', 'cogs', 'epd'}
         lines = []
-        for line in bill.invoice_line_ids:
+        inv_line_ids = bill.invoice_line_ids
+        all_line_ids = bill.line_ids
+        _logger.info(
+            "get_vendor_bill_detail bill=%s invoice_line_ids=%d line_ids=%d",
+            bill.id, len(inv_line_ids), len(all_line_ids),
+        )
+        for line in all_line_ids:
+            if line.display_type and line.display_type in NON_INVOICE_DISPLAY_TYPES:
+                _logger.debug(
+                    "  Skipping line %s display_type=%s", line.id, line.display_type,
+                )
+                continue
+            _logger.debug(
+                "  Including line %s display_type=%s product=%s",
+                line.id, line.display_type,
+                line.product_id.display_name if line.product_id else 'N/A',
+            )
             lines.append({
                 'id': line.id,
                 'product_id': [line.product_id.id, line.product_id.display_name] if line.product_id else False,
