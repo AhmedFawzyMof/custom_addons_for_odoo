@@ -248,6 +248,7 @@ class VendorBillApi(models.AbstractModel):
             if not tax_ids and product and product.supplier_taxes_id:
                 tax_ids = product.supplier_taxes_id.ids
 
+            purchase_line_id = line.get('purchase_line_id')
             line_vals = {
                 'product_id': int(product_id) if product_id else False,
                 'name': name or 'خط مشتريات',
@@ -255,6 +256,7 @@ class VendorBillApi(models.AbstractModel):
                 'price_unit': price_unit,
                 'discount': discount,
                 'tax_ids': [(6, 0, [int(t) for t in tax_ids])] if tax_ids else False,
+                'purchase_line_id': int(purchase_line_id) if purchase_line_id else False,
             }
             invoice_lines.append((0, 0, line_vals))
 
@@ -295,6 +297,7 @@ class VendorBillApi(models.AbstractModel):
         try:
             if new_status == 'posted' and bill.state == 'draft':
                 self._ensure_invoice_taxes(bill)
+                self._create_bill_stock_moves(bill)
                 if hasattr(bill, 'check_total'):
                     bill.write({'check_total': bill.amount_total})
                 bill.action_post()
@@ -381,3 +384,28 @@ class VendorBillApi(models.AbstractModel):
             }
         except Exception as e:
             return {'success': False, 'message': f'فشل في تسجيل الدفعة: {str(e)}'}
+
+    def _create_bill_stock_moves(self, bill):
+        """Create stock moves for storable products on vendor bill lines
+        that lack purchase_line_id. This ensures posting the bill also
+        creates stock valuation layers and updates stock.quant."""
+        for line in bill.invoice_line_ids:
+            product = line.product_id
+            if not product or product.type != 'product':
+                continue
+            if line.purchase_line_id and line.purchase_line_id.move_ids:
+                continue
+            move = self.env['stock.move'].create({
+                'name': line.name or product.display_name,
+                'product_id': product.id,
+                'product_uom_qty': line.quantity,
+                'product_uom': line.product_uom_id.id,
+                'location_id': self.env.ref('stock.stock_location_suppliers').id,
+                'location_dest_id': product.property_stock_location.id or
+                                    self.env.ref('stock.stock_location_stock').id,
+                'company_id': bill.company_id.id,
+            })
+            move._action_confirm()
+            move._action_assign()
+            move.quantity_done = line.quantity
+            move._action_done()
