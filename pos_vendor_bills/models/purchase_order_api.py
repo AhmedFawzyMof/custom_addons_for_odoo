@@ -361,14 +361,33 @@ class PurchaseOrderApi(models.AbstractModel):
 
             if new_state and new_state != po.state:
                 if new_state == 'purchase' and po.state == 'draft':
+                    _logger.info("=== UPDATE->CONFIRM PO %s (id=%s) ===", po.name, po.id)
+                    for line in po.order_line:
+                        prod = line.product_id
+                        _logger.info(
+                            "PO LINE id=%s product=%s (pid=%s) | line.product_uom=%s (cat=%s) | "
+                            "product.uom_id=%s (cat=%s) | product.uom_po_id=%s (cat=%s)",
+                            line.id, prod.display_name, prod.id,
+                            line.product_uom.name, line.product_uom.category_id.name,
+                            prod.uom_id.name, prod.uom_id.category_id.name,
+                            prod.uom_po_id.name, prod.uom_po_id.category_id.name,
+                        )
                     for line in po.order_line:
                         if line.product_uom.category_id != line.product_id.uom_id.category_id:
+                            _logger.error(
+                                "UOM MISMATCH at update-confirm: line %s product_uom=%s vs product.uom_id=%s",
+                                line.id, line.product_uom.name, line.product_id.uom_id.name,
+                            )
                             return {'success': False, 'message': (
                                 f'لا تنتمي وحدة القياس {line.product_uom.name} المحددة في بند الطلب ({line.product_id.display_name}) '
                                 f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_id.name} المحددة في المنتج. '
                                 f'يرجى تصحيح وحدة القياس المحددة في بند الطلب أو في المنتج.'
                             )}
-                    po.button_confirm()
+                    try:
+                        po.button_confirm()
+                    except Exception as e:
+                        _logger.exception("=== UPDATE BUTTON_CONFIRM FAILED for PO %s ===", po.name)
+                        raise
                 elif new_state == 'cancel' and po.state != 'cancel':
                     po.button_cancel()
                 elif new_state == 'draft' and po.state == 'cancel':
@@ -400,16 +419,36 @@ class PurchaseOrderApi(models.AbstractModel):
             return {'success': False, 'message': f'Cannot confirm PO in state: {po.state}'}
 
         try:
+            _logger.info("=== CONFIRM PO %s (id=%s) ===", po.name, po.id)
+            for line in po.order_line:
+                prod = line.product_id
+                _logger.info(
+                    "PO LINE id=%s product=%s (pid=%s) | line.product_uom=%s (cat=%s) | "
+                    "product.uom_id=%s (cat=%s) | product.uom_po_id=%s (cat=%s)",
+                    line.id, prod.display_name, prod.id,
+                    line.product_uom.name, line.product_uom.category_id.name,
+                    prod.uom_id.name, prod.uom_id.category_id.name,
+                    prod.uom_po_id.name, prod.uom_po_id.category_id.name,
+                )
+
             # Validate UOM category compatibility before confirmation
             for line in po.order_line:
                 if line.product_uom.category_id != line.product_id.uom_id.category_id:
+                    _logger.error(
+                        "UOM MISMATCH at confirm: line %s product_uom=%s vs product.uom_id=%s",
+                        line.id, line.product_uom.name, line.product_id.uom_id.name,
+                    )
                     return {'success': False, 'message': (
                         f'لا تنتمي وحدة القياس {line.product_uom.name} المحددة في بند الطلب ({line.product_id.display_name}) '
                         f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_id.name} المحددة في المنتج. '
                         f'يرجى تصحيح وحدة القياس المحددة في بند الطلب أو في المنتج.'
                     )}
 
-            po.button_confirm()
+            try:
+                po.button_confirm()
+            except Exception as e:
+                _logger.exception("=== BUTTON_CONFIRM FAILED for PO %s ===", po.name)
+                raise
 
             # Bypass intermediate warehouse steps for POS receipts
             for picking in po.picking_ids:
