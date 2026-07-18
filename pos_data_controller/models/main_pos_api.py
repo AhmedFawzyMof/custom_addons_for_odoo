@@ -230,11 +230,17 @@ class PosConfig(models.Model):
 
         if search_text:
             search_text = search_text.strip()
+            # Check if search_text looks like a 7-digit product code from weight barcode
+            # If so, also search for barcodes starting with this code + 6 chars (5 weight digits + 1 check)
+            import re
+            is_product_code = bool(re.match(r'^\d{7}$', search_text))
+            barcode_pattern = search_text + "______" if is_product_code else search_text
+
             product_domain.append('|')
             product_domain.append('|')
             product_domain.append(('name', 'ilike', search_text))
             product_domain.append(('default_code', 'ilike', search_text))
-            product_domain.append(('barcode', 'ilike', search_text))
+            product_domain.append(('barcode', 'ilike', barcode_pattern))
 
         category_counts_domain = [('available_in_pos', '=', True)]
         if has_location_filter:
@@ -244,7 +250,7 @@ class PosConfig(models.Model):
             category_counts_domain.append('|')
             category_counts_domain.append(('name', 'ilike', search_text))
             category_counts_domain.append(('default_code', 'ilike', search_text))
-            category_counts_domain.append(('barcode', 'ilike', search_text))
+            category_counts_domain.append(('barcode', 'ilike', barcode_pattern))
 
         count_data = self.env['product.product'].read_group(
             domain=category_counts_domain,
