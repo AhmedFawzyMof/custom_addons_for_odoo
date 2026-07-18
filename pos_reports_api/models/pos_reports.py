@@ -72,6 +72,30 @@ class PosReportsApi(models.Model):
         so_revenue = float(cr.fetchone()[0])
         total_revenue = pos_revenue + so_revenue
 
+        # Discounts from POS orders (sum of line discounts)
+        cr.execute("""
+            SELECT COALESCE(SUM(pol.price_unit * pol.qty * pol.discount / 100.0), 0)
+            FROM pos_order_line pol
+            JOIN pos_order po ON po.id = pol.order_id
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+        """, (dt_from, dt_to, tuple(_cids)))
+        total_discounts = float(cr.fetchone()[0])
+
+        # Loss: unpaid amount (amount_total - amount_paid) for POS orders
+        cr.execute("""
+            SELECT COALESCE(SUM(po.amount_total - po.amount_paid), 0)
+            FROM pos_order po
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+        """, (dt_from, dt_to, tuple(_cids)))
+        total_loss = float(cr.fetchone()[0])
+
+        # Combined: خصومات + خسارة غير المدفوع = إجمالي الخسارة
+        total_discounts_loss = total_discounts + total_loss
+
         # Payment totals by method type (cash / bank / pay_later)
         cr.execute("""
             SELECT CASE
@@ -127,6 +151,7 @@ class PosReportsApi(models.Model):
 
         summary = [
             {"label": "إجمالي الإيرادات", "value": f"{total_revenue:,.2f}", "icon": "trending_up", "color": "primary"},
+            {"label": "الخصومات (خسارة)", "value": f"{total_discounts_loss:,.2f}", "icon": "tag", "color": "error"},
             {"label": "تكلفة البضاعة", "value": f"{cogs:,.2f}", "icon": "shopping_cart", "color": "tertiary"},
             {"label": "إجمالي الربح", "value": f"{gross_profit:,.2f}", "icon": "account_balance_wallet", "color": "secondary"},
             {"label": "صافي الربح", "value": f"{net_profit:,.2f}", "icon": "payments", "color": "primary" if net_profit >= 0 else "error"},
@@ -890,6 +915,17 @@ class PosReportsApi(models.Model):
         total_orders = row[0] or 0
         total_amount = float(row[1] or 0.0)
 
+        # Discounts from POS orders
+        cr.execute("""
+            SELECT COALESCE(SUM(pol.price_unit * pol.qty * pol.discount / 100.0), 0)
+            FROM pos_order_line pol
+            JOIN pos_order po ON po.id = pol.order_id
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+        """, (dt_from, dt_to, tuple(_cids)))
+        total_discounts = float(cr.fetchone()[0])
+
         # Payment totals by method type
         cr.execute("""
             SELECT CASE
@@ -931,6 +967,7 @@ class PosReportsApi(models.Model):
         summary = [
             {"label": "عدد الطلبات", "value": str(total_orders), "icon": "receipt", "color": "primary"},
             {"label": "إجمالي المبيعات", "value": f"{total_amount:,.2f}", "icon": "trending_up", "color": "secondary"},
+            {"label": "إجمالي الخصومات", "value": f"{total_discounts:,.2f}", "icon": "tag", "color": "error"},
             {"label": "إجمالي النقدي", "value": f"{cash_total:,.2f}", "icon": "cash", "color": "success"},
             {"label": "إجمالي البطاقة", "value": f"{card_total:,.2f}", "icon": "credit_card", "color": "primary"},
             {"label": "حساب العميل", "value": f"{account_total:,.2f}", "icon": "users", "color": "tertiary"},

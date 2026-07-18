@@ -83,6 +83,7 @@ class CustomOrderApi(models.AbstractModel):
                 'amount_paid': order.amount_paid,
                 'amount_tax': order.amount_tax,
                 'amount_return': order.amount_return,
+                'amount_discount': order.amount_total - sum(l.price_subtotal for l in order.lines),
             })
 
         return {

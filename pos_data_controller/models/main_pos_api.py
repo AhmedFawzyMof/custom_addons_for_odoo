@@ -747,7 +747,7 @@ class PosOrder(models.Model):
         """
         session_id = kwargs.get('session_id') or (args[0] if len(args) > 0 else None)
         payload    = kwargs.get('payload')    or (args[1] if len(args) > 1 else {})
-        forced_loc = kwargs.get('target_location_id', False)
+        forced_loc = kwargs.get('target_location_id') or payload.get('target_location_id', False)
 
         if not session_id or not payload:
             return {
@@ -771,6 +771,22 @@ class PosOrder(models.Model):
             # 2. بناء بنود الطلب يدوياً وحساب الأسعار والضرائب
             product_ids = [int(i.get('product_id')) for i in items if i.get('product_id')]
             products_map = {p.id: p for p in self.env['product.product'].browse(product_ids)}
+
+            # Auto-detect location with stock if none selected
+            if not forced_loc and product_ids:
+                StockQuant = self.env['stock.quant']
+                domain = [
+                    ('product_id', 'in', product_ids),
+                    ('location_id.usage', '=', 'internal'),
+                    ('quantity', '>', 0),
+                ]
+                quants = StockQuant.search(domain)
+                if quants:
+                    location_scores = {}
+                    for q in quants:
+                        location_scores[q.location_id.id] = location_scores.get(q.location_id.id, 0) + q.quantity
+                    if location_scores:
+                        forced_loc = max(location_scores, key=location_scores.get)
 
             order_lines = []
             total_order_subtotal = 0.0
@@ -803,6 +819,11 @@ class PosOrder(models.Model):
                 # 💡 ربط مصفوفة الضرائب بالبند إذا تم إرسالها من الـ Frontend
                 if frontend_tax_ids:
                     line_vals['tax_ids'] = [(6, 0, [int(tid) for tid in frontend_tax_ids])]
+                    # حساب السعر شامل الضريبة إذا كانت هناك ضرائب
+                    taxes = self.env['account.tax'].browse([int(tid) for tid in frontend_tax_ids])
+                    if taxes:
+                        tax_results = taxes.compute_all(price_unit * (1.0 - discount / 100.0), quantity=qty)
+                        line_vals['price_subtotal_incl'] = tax_results['total_included']
 
                 order_lines.append((0, 0, line_vals))
 
@@ -840,8 +861,17 @@ class PosOrder(models.Model):
                         'payment_date': fields.Datetime.now(),
                     }))
 
-            frontend_tax = float(payload.get('amount_tax', 0.0))
-            final_total = total_order_subtotal + (service_fee if service_fee > 0 else 0) + frontend_tax
+            # Apply order-level discount
+            order_discount = float(payload.get('order_discount', 0))
+            order_discount_type = payload.get('order_discount_type', 'amount')
+            
+            if order_discount_type == 'percent' and total_order_subtotal > 0:
+                order_discount = (order_discount / 100.0) * total_order_subtotal
+            
+            final_total = total_order_subtotal + (service_fee if service_fee > 0 else 0) - order_discount
+            if final_total < 0:
+                final_total = 0.0
+            # taxes computed server-side by _compute_prices() during action_pos_order_paid()
 
             # 4. تجميع بيانات الطلب الرئيسي مع تلبية شروط قواعد البيانات الصارمة للأعمدة المطلوبة
             pos_order_vals = {
@@ -852,7 +882,7 @@ class PosOrder(models.Model):
                 'lines': order_lines,
                 'payment_ids': order_payments,
                 'amount_total': final_total,
-                'amount_tax': float(frontend_tax),
+                'amount_tax': float(payload.get('amount_tax', 0)),
                 'amount_paid': payments_total,
                 'amount_return': max(0.0, payments_total - final_total),
                 'date_order': fields.Datetime.now(),
@@ -868,17 +898,14 @@ class PosOrder(models.Model):
                 elif 'pos_note' in self._fields:
                     pos_order_vals['pos_note'] = raw_note
 
-            # 5. التوجيه المباشر ومحاكاة تغيير المستودع إن وجد موقع بديل مُمرر
+            # 5. إنشاء السجل الفعلي في قاعدة البيانات
+            # تمرير forced_loc عبر context للـ create method لاستخدامه في picking
             pos_model = self.sudo().with_company(session.company_id)
             if forced_loc:
-                original_location = session.config_id.picking_type_id.default_location_src_id
-                session.config_id.picking_type_id.write({'default_location_src_id': int(forced_loc)})
+                pos_model = pos_model.with_context(force_picking_location=forced_loc)
 
             # إنشاء السجل الفعلي في قاعدة البيانات
             new_order = pos_model.create(pos_order_vals)
-
-            if forced_loc:
-                session.config_id.picking_type_id.write({'default_location_src_id': original_location.id})
 
             # 6. تحديث حسابات الطلب وتأكيد عمليات المخازن والترحيل تلقائياً
             new_order._compute_total_all_at_once() if hasattr(new_order, '_compute_total_all_at_once') else None
