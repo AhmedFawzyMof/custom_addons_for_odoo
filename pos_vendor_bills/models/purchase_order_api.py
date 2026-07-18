@@ -373,16 +373,26 @@ class PurchaseOrderApi(models.AbstractModel):
                             prod.uom_po_id.name, prod.uom_po_id.category_id.name,
                         )
                     for line in po.order_line:
-                        if line.product_uom.category_id != line.product_id.uom_id.category_id:
+                        if (line.product_uom.category_id != line.product_id.uom_id.category_id
+                                or line.product_uom.category_id != line.product_id.uom_po_id.category_id):
                             _logger.error(
-                                "UOM MISMATCH at update-confirm: line %s product_uom=%s vs product.uom_id=%s",
-                                line.id, line.product_uom.name, line.product_id.uom_id.name,
+                                "UOM MISMATCH at update-confirm: line %s product_uom=%s vs product.uom_id=%s / uom_po_id=%s",
+                                line.id, line.product_uom.name, line.product_id.uom_id.name, line.product_id.uom_po_id.name,
                             )
                             return {'success': False, 'message': (
                                 f'لا تنتمي وحدة القياس {line.product_uom.name} المحددة في بند الطلب ({line.product_id.display_name}) '
-                                f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_id.name} المحددة في المنتج. '
+                                f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_po_id.name} المحددة في المنتج للشراء. '
                                 f'يرجى تصحيح وحدة القياس المحددة في بند الطلب أو في المنتج.'
                             )}
+                    # Normalize line UOM to product purchase UOM before confirm
+                    for line in po.order_line:
+                        prod = line.product_id
+                        if line.product_uom != prod.uom_po_id and line.product_uom.category_id == prod.uom_po_id.category_id:
+                            converted_qty = line.product_uom._compute_quantity(line.product_qty, prod.uom_po_id)
+                            line.write({
+                                'product_qty': converted_qty,
+                                'product_uom': prod.uom_po_id.id,
+                            })
                     try:
                         po.button_confirm()
                     except Exception as e:
@@ -433,16 +443,26 @@ class PurchaseOrderApi(models.AbstractModel):
 
             # Validate UOM category compatibility before confirmation
             for line in po.order_line:
-                if line.product_uom.category_id != line.product_id.uom_id.category_id:
+                if (line.product_uom.category_id != line.product_id.uom_id.category_id
+                        or line.product_uom.category_id != line.product_id.uom_po_id.category_id):
                     _logger.error(
-                        "UOM MISMATCH at confirm: line %s product_uom=%s vs product.uom_id=%s",
-                        line.id, line.product_uom.name, line.product_id.uom_id.name,
+                        "UOM MISMATCH at confirm: line %s product_uom=%s vs product.uom_id=%s / uom_po_id=%s",
+                        line.id, line.product_uom.name, line.product_id.uom_id.name, line.product_id.uom_po_id.name,
                     )
                     return {'success': False, 'message': (
                         f'لا تنتمي وحدة القياس {line.product_uom.name} المحددة في بند الطلب ({line.product_id.display_name}) '
-                        f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_id.name} المحددة في المنتج. '
+                        f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_po_id.name} المحددة في المنتج للشراء. '
                         f'يرجى تصحيح وحدة القياس المحددة في بند الطلب أو في المنتج.'
                     )}
+            # Normalize line UOM to product purchase UOM before confirm
+            for line in po.order_line:
+                prod = line.product_id
+                if line.product_uom != prod.uom_po_id and line.product_uom.category_id == prod.uom_po_id.category_id:
+                    converted_qty = line.product_uom._compute_quantity(line.product_qty, prod.uom_po_id)
+                    line.write({
+                        'product_qty': converted_qty,
+                        'product_uom': prod.uom_po_id.id,
+                    })
 
             try:
                 po.button_confirm()
