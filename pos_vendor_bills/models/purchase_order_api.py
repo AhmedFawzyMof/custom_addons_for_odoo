@@ -361,6 +361,13 @@ class PurchaseOrderApi(models.AbstractModel):
 
             if new_state and new_state != po.state:
                 if new_state == 'purchase' and po.state == 'draft':
+                    for line in po.order_line:
+                        if line.product_uom.category_id != line.product_id.uom_id.category_id:
+                            return {'success': False, 'message': (
+                                f'لا تنتمي وحدة القياس {line.product_uom.name} المحددة في بند الطلب ({line.product_id.display_name}) '
+                                f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_id.name} المحددة في المنتج. '
+                                f'يرجى تصحيح وحدة القياس المحددة في بند الطلب أو في المنتج.'
+                            )}
                     po.button_confirm()
                 elif new_state == 'cancel' and po.state != 'cancel':
                     po.button_cancel()
@@ -393,6 +400,15 @@ class PurchaseOrderApi(models.AbstractModel):
             return {'success': False, 'message': f'Cannot confirm PO in state: {po.state}'}
 
         try:
+            # Validate UOM category compatibility before confirmation
+            for line in po.order_line:
+                if line.product_uom.category_id != line.product_id.uom_id.category_id:
+                    return {'success': False, 'message': (
+                        f'لا تنتمي وحدة القياس {line.product_uom.name} المحددة في بند الطلب ({line.product_id.display_name}) '
+                        f'إلى نفس الفئة التي تنتمي إليها وحدة القياس {line.product_id.uom_id.name} المحددة في المنتج. '
+                        f'يرجى تصحيح وحدة القياس المحددة في بند الطلب أو في المنتج.'
+                    )}
+
             po.button_confirm()
 
             # Bypass intermediate warehouse steps for POS receipts
