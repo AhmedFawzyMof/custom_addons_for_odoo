@@ -175,6 +175,7 @@ class PosConfig(models.Model):
         category_id = kwargs.get('category_id') or (args[3] if len(args) > 3 else None)
         location_id = kwargs.get('location_id') or (args[4] if len(args) > 4 else None)
         search_text = kwargs.get('search_text') or (args[5] if len(args) > 5 else '')
+        to_weight   = kwargs.get('to_weight')   or (args[6] if len(args) > 6 else None)
 
         if not config_id:
             return {'status': 'error', 'message': 'Missing config_id parameter'}
@@ -242,6 +243,9 @@ class PosConfig(models.Model):
             product_domain.append(('default_code', 'ilike', search_text))
             product_domain.append(('barcode', 'ilike', barcode_pattern))
 
+        if to_weight and str(to_weight).strip() in ('1', 'true', 'True'):
+            product_domain.append(('to_weight', '=', True))
+
         category_counts_domain = [('available_in_pos', '=', True)]
         if has_location_filter:
             category_counts_domain.append(('id', 'in', available_product_ids))
@@ -251,6 +255,9 @@ class PosConfig(models.Model):
             category_counts_domain.append(('name', 'ilike', search_text))
             category_counts_domain.append(('default_code', 'ilike', search_text))
             category_counts_domain.append(('barcode', 'ilike', barcode_pattern))
+
+        if to_weight and str(to_weight).strip() in ('1', 'true', 'True'):
+            category_counts_domain.append(('to_weight', '=', True))
 
         count_data = self.env['product.product'].read_group(
             domain=category_counts_domain,

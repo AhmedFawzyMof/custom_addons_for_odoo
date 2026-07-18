@@ -209,7 +209,7 @@ class PurchaseOrderApi(models.AbstractModel):
                 'product_qty': quantity,
                 'price_unit': price_unit,
                 'price_subtotal': quantity * price_unit,
-                'product_uom': product.uom_po_id.id or product.uom_id.id,
+                'product_uom': product.uom_po_id.id if product.uom_po_id.category_id == product.uom_id.category_id else product.uom_id.id,
                 'taxes_id': tax_ids if isinstance(tax_ids, list) else [(6, 0, tax_ids)],
                 'date_planned': fields.Datetime.now(),
             }))
@@ -316,7 +316,7 @@ class PurchaseOrderApi(models.AbstractModel):
                         'name': name,
                         'product_qty': quantity,
                         'price_unit': price_unit,
-                        'product_uom': product.uom_po_id.id or product.uom_id.id,
+                        'product_uom': product.uom_po_id.id if product.uom_po_id.category_id == product.uom_id.category_id else product.uom_id.id,
                         'taxes_id': tax_command,
                         'date_planned': fields.Datetime.now(),
                     }
