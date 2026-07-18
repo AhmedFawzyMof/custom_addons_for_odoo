@@ -176,6 +176,7 @@ class PosConfig(models.Model):
         location_id = kwargs.get('location_id') or (args[4] if len(args) > 4 else None)
         search_text = kwargs.get('search_text') or (args[5] if len(args) > 5 else '')
         to_weight   = kwargs.get('to_weight')   or (args[6] if len(args) > 6 else None)
+        exact_barcode = kwargs.get('exact_barcode') or (args[7] if len(args) > 7 else '')
 
         if not config_id:
             return {'status': 'error', 'message': 'Missing config_id parameter'}
@@ -229,22 +230,35 @@ class PosConfig(models.Model):
             available_product_ids = list(set(quant_records.mapped('product_id.id')))
             product_domain.append(('id', 'in', available_product_ids))
 
+        is_product_code = False
         if search_text:
             search_text = search_text.strip()
             # Check if search_text looks like a 7-digit product code from weight barcode
-            # If so, also search for barcodes starting with this code + 6 chars (5 weight digits + 1 check)
+            # If so, search for exact 7-digit barcode AND 13-char wildcard pattern
             import re
             is_product_code = bool(re.match(r'^\d{7}$', search_text))
-            barcode_pattern = search_text + "______" if is_product_code else search_text
 
             product_domain.append('|')
             product_domain.append('|')
             product_domain.append(('name', 'ilike', search_text))
             product_domain.append(('default_code', 'ilike', search_text))
-            product_domain.append(('barcode', 'ilike', barcode_pattern))
+            if is_product_code:
+                product_domain.append('|')
+                product_domain.append(('barcode', 'ilike', search_text))
+                product_domain.append(('barcode', 'ilike', search_text + "______"))
+            else:
+                product_domain.append(('barcode', 'ilike', search_text))
 
         if to_weight and str(to_weight).strip() in ('1', 'true', 'True'):
-            product_domain.append(('to_weight', '=', True))
+            product_domain.append(('product_tmpl_id.to_weight', '=', True))
+
+        if exact_barcode:
+            product_domain = [
+                ('available_in_pos', '=', True),
+                '|', ('company_id', '=', False), ('company_id', '=', config_company_id),
+                ('barcode', '=', exact_barcode.strip()),
+            ]
+            limit = 1
 
         category_counts_domain = [('available_in_pos', '=', True)]
         if has_location_filter:
@@ -254,10 +268,15 @@ class PosConfig(models.Model):
             category_counts_domain.append('|')
             category_counts_domain.append(('name', 'ilike', search_text))
             category_counts_domain.append(('default_code', 'ilike', search_text))
-            category_counts_domain.append(('barcode', 'ilike', barcode_pattern))
+            if is_product_code:
+                category_counts_domain.append('|')
+                category_counts_domain.append(('barcode', 'ilike', search_text))
+                category_counts_domain.append(('barcode', 'ilike', search_text + "______"))
+            else:
+                category_counts_domain.append(('barcode', 'ilike', search_text))
 
         if to_weight and str(to_weight).strip() in ('1', 'true', 'True'):
-            category_counts_domain.append(('to_weight', '=', True))
+            category_counts_domain.append(('product_tmpl_id.to_weight', '=', True))
 
         count_data = self.env['product.product'].read_group(
             domain=category_counts_domain,
@@ -294,6 +313,20 @@ class PosConfig(models.Model):
 
         total_products = self.env['product.product'].search_count(product_domain)
         products = self.env['product.product'].search(product_domain, limit=limit, offset=offset, order='id asc')
+
+        if exact_barcode:
+            if len(products) > 1:
+                _logger.warning(
+                    f"[WEIGHT-BARCODE] ERROR: Multiple products for exact barcode {exact_barcode}"
+                )
+                _logger.warning(f"[WEIGHT-BARCODE] Matching product IDs: {products.ids}")
+            elif len(products) == 1:
+                _logger.info(
+                    f"[WEIGHT-BARCODE] Exact product matches: 1"
+                )
+                _logger.info(
+                    f"[WEIGHT-BARCODE] Resolved product: {products[0].display_name}"
+                )
 
         # Pre-compute attribute lines per template (all attribute options for variant picker)
         template_ids = set(prod.product_tmpl_id.id for prod in products)
