@@ -11,3 +11,5 @@ access_late_payment_api,late.payment.api,model_late_payment_api,point_of_sale.gr
 access_late_payment_api_manager,late.payment.api,model_late_payment_api,point_of_sale.group_pos_manager,1,1,1,1
 access_po_line_location,purchase.order.line.location,model_purchase_order_line_location,point_of_sale.group_pos_user,1,1,1,0
 access_po_line_location_manager,purchase.order.line.location,model_purchase_order_line_location,point_of_sale.group_pos_manager,1,1,1,1
+access_po_change_log,purchase.order.change.log,model_purchase_order_change_log,point_of_sale.group_pos_user,1,0,1,0
+access_po_change_log_manager,purchase.order.change.log,model_purchase_order_change_log,point_of_sale.group_pos_manager,1,1,0,0

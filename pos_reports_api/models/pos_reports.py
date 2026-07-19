@@ -2,8 +2,55 @@ from odoo import models, api, fields
 from datetime import datetime, date, timezone, timedelta
 from collections import defaultdict
 import logging
+import json
 
 _logger = logging.getLogger(__name__)
+
+
+def _serialize(val):
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    if isinstance(val, (set,)):
+        return list(val)
+    return val
+
+
+class ReportQueryLogger:
+    """Report-level query lifecycle logging."""
+
+    @staticmethod
+    def log_start(method_name, date_from, date_to, **kw):
+        _logger.info(
+            "REPORT START | method=%s | date_from=%s | date_to=%s | filters=%s | timestamp=%s",
+            method_name, date_from, date_to,
+            json.dumps(kw, default=_serialize),
+            datetime.utcnow().isoformat(),
+        )
+
+    @staticmethod
+    def log_sql(cr, query, params):
+        _logger.info(
+            "REPORT SQL | query=%s | params=%s",
+            query.replace('\n', ' ').replace('\r', ' '),
+            params,
+        )
+
+    @staticmethod
+    def log_result(method_name, key, value, record_count=0):
+        _logger.info(
+            "REPORT RESULT | method=%s | key=%s | value=%s | record_count=%s | timestamp=%s",
+            method_name, key,
+            json.dumps(_serialize(value), default=_serialize) if not isinstance(value, str) else value,
+            record_count,
+            datetime.utcnow().isoformat(),
+        )
+
+    @staticmethod
+    def log_end(method_name, status='success'):
+        _logger.info(
+            "REPORT END | method=%s | status=%s | timestamp=%s",
+            method_name, status, datetime.utcnow().isoformat(),
+        )
 
 
 class PosReportsApi(models.Model):
@@ -37,21 +84,54 @@ class PosReportsApi(models.Model):
         cairo_tz = timezone(timedelta(hours=2))
         cairo_now = datetime.now(cairo_tz)
         today_str = cairo_now.strftime('%Y-%m-%d')
-        month_start_str = cairo_now.replace(day=1).strftime('%Y-%m-%d')
-        date_from = self._parse_date(date_from, month_start_str)
+        now_str = cairo_now.strftime('%Y-%m-%d %H:%M:%S')
+        date_from = self._parse_date(date_from, today_str)
         date_to = self._parse_date(date_to, today_str)
-        return date_from, date_to, f"{date_from} 00:00:00", f"{date_to} 23:59:59"
+        dt_from = f"{date_from} 00:00:00"
+        if date_from == today_str and date_to == today_str:
+            dt_to = now_str
+        else:
+            dt_to = f"{date_to} 23:59:59"
+        _logger.info(
+            "REPORT DATES | date_from=%s | date_to=%s | dt_from=%s | dt_to=%s | cairo_now=%s",
+            date_from, date_to, dt_from, dt_to, cairo_now.isoformat(),
+        )
+        return date_from, date_to, dt_from, dt_to
+
+    def _name_map_from_sql(self, model, ids, name_field='display_name'):
+        """Look up display names via SQL to bypass ORM cache. Falls back to ORM if
+        the table/column isn't found."""
+        if not ids:
+            return {}
+        cr = self.env.cr
+        if model == 'product.template':
+            sql = "SELECT id, COALESCE(%s, name) FROM product_template WHERE id IN %%s" % name_field
+        elif model == 'account.tax':
+            sql = "SELECT id, name FROM account_tax WHERE id IN %%s"
+        elif model == 'account.account':
+            sql = "SELECT id, name FROM account_account WHERE id IN %%s"
+        else:
+            return {}
+        try:
+            cr.execute(sql % name_field if '%s' not in sql else sql, (tuple(ids),))
+            return dict(cr.fetchall())
+        except Exception:
+            _logger.warning("SQL name lookup failed for %s ids=%s, falling back to ORM", model, ids)
+            records = self.env[model].browse(ids)
+            return {r.id: r.display_name if name_field == 'display_name' else r.name for r in records}
 
     # ---------------------------------------------------------------
     # 1. Profit & Loss Report
     # ---------------------------------------------------------------
     @api.model
     def _report_profit_loss(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_profit_loss', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()  # ensure latest committed data
 
-        # Revenue from POS orders
         cr.execute("""
             SELECT COALESCE(SUM(po.amount_total), 0)
             FROM pos_order po
@@ -61,7 +141,6 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         pos_revenue = float(cr.fetchone()[0])
 
-        # Revenue from Sales Orders
         cr.execute("""
             SELECT COALESCE(SUM(so.amount_total), 0)
             FROM sale_order so
@@ -72,7 +151,6 @@ class PosReportsApi(models.Model):
         so_revenue = float(cr.fetchone()[0])
         total_revenue = pos_revenue + so_revenue
 
-        # Discounts from POS orders (sum of line discounts)
         cr.execute("""
             SELECT COALESCE(SUM(pol.price_unit * pol.qty * pol.discount / 100.0), 0)
             FROM pos_order_line pol
@@ -83,7 +161,6 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         total_discounts = float(cr.fetchone()[0])
 
-        # Loss: unpaid amount (amount_total - amount_paid) for POS orders
         cr.execute("""
             SELECT COALESCE(SUM(po.amount_total - po.amount_paid), 0)
             FROM pos_order po
@@ -93,10 +170,8 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         total_loss = float(cr.fetchone()[0])
 
-        # Combined: خصومات + خسارة غير المدفوع = إجمالي الخسارة
         total_discounts_loss = total_discounts + total_loss
 
-        # Payment totals by method type (cash / bank / pay_later)
         cr.execute("""
             SELECT CASE
                 WHEN pj.type = 'cash' THEN 'cash'
@@ -118,7 +193,6 @@ class PosReportsApi(models.Model):
         card_total = payment_totals.get('bank', 0.0)
         account_total = payment_totals.get('pay_later', 0.0)
 
-        # Expenses by category
         cr.execute("""
             SELECT aa.name, COALESCE(SUM(aml.debit - aml.credit), 0) as amount
             FROM account_move_line aml
@@ -133,7 +207,6 @@ class PosReportsApi(models.Model):
         expense_rows = cr.fetchall()
         total_expenses = sum(r[1] for r in expense_rows) or 0.0
 
-        # Cost of Goods Sold (safely check if svl table exists)
         cogs = 0.0
         if self._table_exists('stock_valuation_layer'):
             cr.execute("""
@@ -160,7 +233,6 @@ class PosReportsApi(models.Model):
             {"label": "حساب العميل", "value": f"{account_total:,.2f}", "icon": "users", "color": "tertiary"},
         ]
 
-        # Monthly breakdown for chart
         cr.execute("""
             SELECT TO_CHAR(po.date_order, 'YYYY-MM') as month, SUM(po.amount_total)
             FROM pos_order po
@@ -206,16 +278,24 @@ class PosReportsApi(models.Model):
             {"category": "صافي الربح", "amount": net_profit},
         ]
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_profit_loss', 'total_revenue', total_revenue)
+        log.log_result('_report_profit_loss', 'cogs', cogs)
+        log.log_result('_report_profit_loss', 'net_profit', net_profit)
+        log.log_end('_report_profit_loss')
+        return result
 
     # ---------------------------------------------------------------
     # 2. Purchases & Sales Report
     # ---------------------------------------------------------------
     @api.model
     def _report_purchases_sales(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_purchases_sales', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT TO_CHAR(po.date_order, 'YYYY-MM'), COALESCE(SUM(po.amount_total), 0)
@@ -257,7 +337,7 @@ class PosReportsApi(models.Model):
             ],
         }
 
-        return {
+        result = {
             "summary": summary,
             "chart": chart,
             "columns": [
@@ -267,15 +347,22 @@ class PosReportsApi(models.Model):
             ],
             "rows": [{"month": m, "purchases": monthly_purchases.get(m, 0), "sales": monthly_sales.get(m, 0)} for m in all_months],
         }
+        log.log_result('_report_purchases_sales', 'total_purchases', total_purchases)
+        log.log_result('_report_purchases_sales', 'total_sales', total_sales)
+        log.log_end('_report_purchases_sales')
+        return result
 
     # ---------------------------------------------------------------
     # 3. Tax Report
     # ---------------------------------------------------------------
     @api.model
     def _report_tax(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_tax', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT at.id, at.name, COALESCE(SUM(po.amount_tax), 0)
@@ -290,10 +377,6 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         tax_rows = cr.fetchall()
 
-        tax_ids = [r[0] for r in tax_rows]
-        taxes = self.env['account.tax'].browse(tax_ids)
-        name_map = {t.id: t.name for t in taxes}
-
         total_tax = sum(r[2] for r in tax_rows) or 0.0
 
         summary = [
@@ -303,30 +386,37 @@ class PosReportsApi(models.Model):
 
         chart = {
             "type": "pie",
-            "labels": [name_map[r[0]] for r in tax_rows],
+            "labels": [r[1] for r in tax_rows],  # tax name directly from SQL
             "datasets": [
                 {"label": "الضريبة", "data": [float(r[2]) for r in tax_rows]},
             ],
         }
 
-        return {
+        result = {
             "summary": summary,
             "chart": chart,
             "columns": [
                 {"key": "tax_name", "label": "نوع الضريبة"},
                 {"key": "amount", "label": "المبلغ", "type": "number"},
             ],
-            "rows": [{"tax_name": name_map[r[0]], "amount": float(r[2])} for r in tax_rows],
+            "rows": [{"tax_name": r[1], "amount": float(r[2])} for r in tax_rows],
         }
+        log.log_result('_report_tax', 'total_tax', total_tax)
+        log.log_result('_report_tax', 'tax_count', len(tax_rows))
+        log.log_end('_report_tax')
+        return result
 
     # ---------------------------------------------------------------
     # 4. Suppliers & Customers Report
     # ---------------------------------------------------------------
     @api.model
     def _report_suppliers_customers(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_suppliers_customers', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT COUNT(*) FROM res_partner
@@ -389,16 +479,23 @@ class PosReportsApi(models.Model):
             ],
         }
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_suppliers_customers', 'total_suppliers', total_suppliers)
+        log.log_result('_report_suppliers_customers', 'total_customers', total_customers)
+        log.log_end('_report_suppliers_customers')
+        return result
 
     # ---------------------------------------------------------------
     # 5. Customer Groups Report
     # ---------------------------------------------------------------
     @api.model
     def _report_customer_groups(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_customer_groups', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT CASE WHEN is_company THEN 'شركات (B2B)' ELSE 'أفراد (تجزئة)' END as group_name,
@@ -424,7 +521,7 @@ class PosReportsApi(models.Model):
             ],
         }
 
-        return {
+        result = {
             "summary": summary,
             "chart": chart,
             "columns": [
@@ -433,15 +530,21 @@ class PosReportsApi(models.Model):
             ],
             "rows": [{"group_name": r[0], "count": r[1]} for r in group_rows],
         }
+        log.log_result('_report_customer_groups', 'total_customers', total)
+        log.log_end('_report_customer_groups')
+        return result
 
     # ---------------------------------------------------------------
     # 6. Stock Report
     # ---------------------------------------------------------------
     @api.model
     def _report_stock(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_stock', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         location_id = kw.get('location_id')
         location_filter = ""
@@ -522,8 +625,7 @@ class PosReportsApi(models.Model):
         top_stock = cr.fetchall()
 
         product_tmpl_ids = [r[0] for r in top_stock]
-        product_templates = self.env['product.template'].browse(product_tmpl_ids)
-        product_name_map = {t.id: t.display_name for t in product_templates}
+        product_name_map = self._name_map_from_sql('product.template', product_tmpl_ids)
 
         summary = [
             {"label": "إجمالي المنتجات", "value": str(total_products), "icon": "shopping_bag", "color": "primary"},
@@ -535,13 +637,13 @@ class PosReportsApi(models.Model):
 
         chart = {
             "type": "bar",
-            "labels": [product_name_map[r[0]] for r in top_stock],
+            "labels": [product_name_map.get(r[0], r[1]) for r in top_stock],
             "datasets": [
                 {"label": "القيمة (التكلفة)", "data": [float(r[3]) for r in top_stock]},
             ],
         }
 
-        return {
+        result = {
             "summary": summary,
             "chart": chart,
             "columns": [
@@ -553,7 +655,7 @@ class PosReportsApi(models.Model):
             ],
             "rows": [
                 {
-                    "product": product_name_map[r[0]],
+                    "product": product_name_map.get(r[0], r[1]),
                     "qty": float(r[2]),
                     "cost_value": float(r[3]),
                     "sale_value": float(r[4]),
@@ -562,15 +664,22 @@ class PosReportsApi(models.Model):
                 for r in top_stock
             ],
         }
+        log.log_result('_report_stock', 'total_value', total_value)
+        log.log_result('_report_stock', 'low_stock_count', low_stock)
+        log.log_end('_report_stock')
+        return result
 
     # ---------------------------------------------------------------
     # 7. Damaged Stock Report
     # ---------------------------------------------------------------
     @api.model
     def _report_damaged_stock(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_damaged_stock', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT ss.name, pt.id, pt.name, ss.date_done,
@@ -584,10 +693,6 @@ class PosReportsApi(models.Model):
             LIMIT 200
         """, (d_from, d_to, tuple(_cids)))
         scrap_rows = cr.fetchall()
-
-        product_tmpl_ids = list({r[1] for r in scrap_rows})
-        product_templates = self.env['product.template'].browse(product_tmpl_ids)
-        name_map = {t.id: t.display_name for t in product_templates}
 
         total_qty = sum(r[5] or 0 for r in scrap_rows)
         total_items = len(scrap_rows)
@@ -605,21 +710,28 @@ class PosReportsApi(models.Model):
             {"key": "state", "label": "الحالة"},
         ]
         rows = [
-            {"reference": r[0], "product": name_map[r[1]], "qty": float(r[5] or 0),
+            {"reference": r[0], "product": r[2], "qty": float(r[5] or 0),
              "date": str(r[3] or ""), "state": r[4] or ""}
             for r in scrap_rows
         ]
 
-        return {"summary": summary, "columns": columns, "rows": rows}
+        result = {"summary": summary, "columns": columns, "rows": rows}
+        log.log_result('_report_damaged_stock', 'total_items', total_items)
+        log.log_result('_report_damaged_stock', 'total_qty', total_qty)
+        log.log_end('_report_damaged_stock')
+        return result
 
     # ---------------------------------------------------------------
     # 8. Popular Products Report
     # ---------------------------------------------------------------
     @api.model
     def _report_popular_products(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_popular_products', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT pt.id, pt.name, COALESCE(SUM(pol.qty), 0) as total_qty,
@@ -637,10 +749,6 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         top_products = cr.fetchall()
 
-        product_tmpl_ids = [r[0] for r in top_products]
-        product_templates = self.env['product.template'].browse(product_tmpl_ids)
-        product_name_map = {t.id: t.display_name for t in product_templates}
-
         total_qty = sum(r[2] for r in top_products)
 
         summary = [
@@ -650,7 +758,7 @@ class PosReportsApi(models.Model):
 
         chart = {
             "type": "bar",
-            "labels": [product_name_map[r[0]] for r in top_products[:10]],
+            "labels": [r[1] for r in top_products[:10]],  # name from SQL
             "datasets": [
                 {"label": "الكمية", "data": [float(r[2]) for r in top_products[:10]]},
             ],
@@ -662,19 +770,26 @@ class PosReportsApi(models.Model):
             {"key": "revenue", "label": "الإيرادات", "type": "number"},
         ]
         rows = [
-            {"product": product_name_map[r[0]], "qty": float(r[2]), "revenue": float(r[3])}
+            {"product": r[1], "qty": float(r[2]), "revenue": float(r[3])}
             for r in top_products
         ]
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_popular_products', 'total_qty', total_qty)
+        log.log_result('_report_popular_products', 'product_count', len(top_products))
+        log.log_end('_report_popular_products')
+        return result
 
     # ---------------------------------------------------------------
     # 9. Items Report
     # ---------------------------------------------------------------
     @api.model
     def _report_items(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_items', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         cr = self.env.cr
+        self.env.cr.commit()
 
         location_id = kw.get('location_id')
         location_filter = ""
@@ -710,10 +825,6 @@ class PosReportsApi(models.Model):
         """.format(location_filter=location_filter), params)
         item_rows = cr.fetchall()
 
-        product_tmpl_ids = list({r[0] for r in item_rows})
-        product_templates = self.env['product.template'].browse(product_tmpl_ids)
-        name_map = {t.id: t.display_name for t in product_templates}
-
         total_items = len(item_rows)
 
         summary = [
@@ -728,21 +839,27 @@ class PosReportsApi(models.Model):
             {"key": "category", "label": "القسم"},
         ]
         rows = [
-            {"code": r[2] or "", "name": name_map[r[0]], "price": float(r[3] or 0),
+            {"code": r[2] or "", "name": r[1], "price": float(r[3] or 0),
              "qty": float(r[4] or 0), "category": r[5] or ""}
             for r in item_rows
         ]
 
-        return {"summary": summary, "columns": columns, "rows": rows}
+        result = {"summary": summary, "columns": columns, "rows": rows}
+        log.log_result('_report_items', 'total_items', total_items)
+        log.log_end('_report_items')
+        return result
 
     # ---------------------------------------------------------------
     # 10. Product Purchases Report
     # ---------------------------------------------------------------
     @api.model
     def _report_product_purchases(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_product_purchases', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT pt.id, pt.name,
@@ -761,10 +878,6 @@ class PosReportsApi(models.Model):
         """, (d_from, d_to, tuple(_cids)))
         product_rows = cr.fetchall()
 
-        product_tmpl_ids = [r[0] for r in product_rows]
-        product_templates = self.env['product.template'].browse(product_tmpl_ids)
-        product_name_map = {t.id: t.display_name for t in product_templates}
-
         total_cost = sum(r[3] for r in product_rows)
 
         summary = [
@@ -774,7 +887,7 @@ class PosReportsApi(models.Model):
 
         chart = {
             "type": "bar",
-            "labels": [product_name_map[r[0]] for r in product_rows[:10]],
+            "labels": [r[1] for r in product_rows[:10]],
             "datasets": [
                 {"label": "التكلفة", "data": [float(r[3]) for r in product_rows[:10]]},
             ],
@@ -786,20 +899,26 @@ class PosReportsApi(models.Model):
             {"key": "cost", "label": "التكلفة", "type": "number"},
         ]
         rows = [
-            {"product": product_name_map[r[0]], "qty": float(r[2]), "cost": float(r[3])}
+            {"product": r[1], "qty": float(r[2]), "cost": float(r[3])}
             for r in product_rows
         ]
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_product_purchases', 'total_cost', total_cost)
+        log.log_end('_report_product_purchases')
+        return result
 
     # ---------------------------------------------------------------
     # 11. Product Sales Report
     # ---------------------------------------------------------------
     @api.model
     def _report_product_sales(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_product_sales', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT pt.id, pt.name,
@@ -818,10 +937,6 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         product_rows = cr.fetchall()
 
-        product_tmpl_ids = [r[0] for r in product_rows]
-        product_templates = self.env['product.template'].browse(product_tmpl_ids)
-        product_name_map = {t.id: t.display_name for t in product_templates}
-
         total_revenue = sum(r[3] for r in product_rows)
 
         summary = [
@@ -831,7 +946,7 @@ class PosReportsApi(models.Model):
 
         chart = {
             "type": "bar",
-            "labels": [product_name_map[r[0]] for r in product_rows[:10]],
+            "labels": [r[1] for r in product_rows[:10]],
             "datasets": [
                 {"label": "الإيرادات", "data": [float(r[3]) for r in product_rows[:10]]},
             ],
@@ -843,20 +958,26 @@ class PosReportsApi(models.Model):
             {"key": "revenue", "label": "الإيرادات", "type": "number"},
         ]
         rows = [
-            {"product": product_name_map[r[0]], "qty": float(r[2]), "revenue": float(r[3])}
+            {"product": r[1], "qty": float(r[2]), "revenue": float(r[3])}
             for r in product_rows
         ]
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_product_sales', 'total_revenue', total_revenue)
+        log.log_end('_report_product_sales')
+        return result
 
     # ---------------------------------------------------------------
     # 12. Purchases Report
     # ---------------------------------------------------------------
     @api.model
     def _report_purchases(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_purchases', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT po.name, rp.name as partner, po.date_order,
@@ -892,18 +1013,24 @@ class PosReportsApi(models.Model):
             for r in purchase_rows
         ]
 
-        return {"summary": summary, "columns": columns, "rows": rows}
+        result = {"summary": summary, "columns": columns, "rows": rows}
+        log.log_result('_report_purchases', 'total_amount', total_amount)
+        log.log_result('_report_purchases', 'total_orders', total_pos)
+        log.log_end('_report_purchases')
+        return result
 
     # ---------------------------------------------------------------
     # 13. Sales Report
     # ---------------------------------------------------------------
     @api.model
     def _report_sales(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_sales', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
-        # Totals from ALL orders in date range
         cr.execute("""
             SELECT COUNT(*), COALESCE(SUM(po.amount_total), 0)
             FROM pos_order po
@@ -915,7 +1042,6 @@ class PosReportsApi(models.Model):
         total_orders = row[0] or 0
         total_amount = float(row[1] or 0.0)
 
-        # Discounts from POS orders
         cr.execute("""
             SELECT COALESCE(SUM(pol.price_unit * pol.qty * pol.discount / 100.0), 0)
             FROM pos_order_line pol
@@ -926,7 +1052,16 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         total_discounts = float(cr.fetchone()[0])
 
-        # Payment totals by method type
+        cr.execute("""
+            SELECT COALESCE(SUM(po.amount_total - po.amount_paid), 0)
+            FROM pos_order po
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+        """, (dt_from, dt_to, tuple(_cids)))
+        total_loss = float(cr.fetchone()[0])
+        total_discounts = total_discounts + total_loss
+
         cr.execute("""
             SELECT CASE
                 WHEN pj.type = 'cash' THEN 'cash'
@@ -948,7 +1083,6 @@ class PosReportsApi(models.Model):
         card_total = payment_totals.get('bank', 0.0)
         account_total = payment_totals.get('pay_later', 0.0)
 
-        # Detail rows
         cr.execute("""
             SELECT po.name, COALESCE(rp.name, 'عميل نقدي') as partner,
                    po.date_order, po.amount_total, po.amount_tax, po.state,
@@ -990,16 +1124,24 @@ class PosReportsApi(models.Model):
             for r in sale_rows
         ]
 
-        return {"summary": summary, "columns": columns, "rows": rows}
+        result = {"summary": summary, "columns": columns, "rows": rows}
+        log.log_result('_report_sales', 'total_orders', total_orders)
+        log.log_result('_report_sales', 'total_amount', total_amount)
+        log.log_result('_report_sales', 'detail_row_count', len(sale_rows))
+        log.log_end('_report_sales')
+        return result
 
     # ---------------------------------------------------------------
     # 14. Expenses Report
     # ---------------------------------------------------------------
     @api.model
     def _report_expenses(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_expenses', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT aa.id, aa.name, COALESCE(SUM(aml.debit - aml.credit), 0) as amount
@@ -1014,10 +1156,8 @@ class PosReportsApi(models.Model):
         """, (d_from, d_to, tuple(_cids)))
         expense_rows = cr.fetchall()
 
-        account_ids = [r[0] for r in expense_rows]
-        accounts = self.env['account.account'].browse(account_ids)
-        name_map = {acc.id: acc.name for acc in accounts}
-
+        # Use SQL name directly instead of ORM browse
+        name_map = {r[0]: r[1] for r in expense_rows}
         total_expenses = sum(r[2] for r in expense_rows) or 0.0
 
         summary = [
@@ -1039,16 +1179,22 @@ class PosReportsApi(models.Model):
         ]
         rows = [{"category": name_map[r[0]], "amount": float(r[2])} for r in expense_rows]
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_expenses', 'total_expenses', total_expenses)
+        log.log_end('_report_expenses')
+        return result
 
     # ---------------------------------------------------------------
     # 15. Shift Report
     # ---------------------------------------------------------------
     @api.model
     def _report_shift(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_shift', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT ps.id, ps.name, pc.name as register, rp.name as user,
@@ -1103,16 +1249,23 @@ class PosReportsApi(models.Model):
             for r in session_rows
         ]
 
-        return {"summary": summary, "columns": columns, "rows": rows}
+        result = {"summary": summary, "columns": columns, "rows": rows}
+        log.log_result('_report_shift', 'total_sessions', total_sessions)
+        log.log_result('_report_shift', 'total_orders', total_orders)
+        log.log_end('_report_shift')
+        return result
 
     # ---------------------------------------------------------------
     # 16. Salesperson Report
     # ---------------------------------------------------------------
     @api.model
     def _report_salesperson(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_salesperson', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
         cr.execute("""
             SELECT rp.name as salesperson,
@@ -1156,18 +1309,24 @@ class PosReportsApi(models.Model):
             for r in sp_rows
         ]
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_salesperson', 'total_sales', total_sales)
+        log.log_result('_report_salesperson', 'salesperson_count', len(sp_rows))
+        log.log_end('_report_salesperson')
+        return result
 
     # ---------------------------------------------------------------
     # 17. Activity Log Report
     # ---------------------------------------------------------------
     @api.model
     def _report_activity_log(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_activity_log', date_from, date_to, **kw)
         _cids = self._get_allowed_companies()
         d_from, d_to, dt_from, dt_to = self._get_dates(date_from, date_to)
         cr = self.env.cr
+        self.env.cr.commit()
 
-        # Order activities
         cr.execute("""
             SELECT po.name, 'طلب بيع' as type, po.date_order as date,
                    rp.name as user, po.state, po.amount_total
@@ -1181,7 +1340,6 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         order_activities = cr.fetchall()
 
-        # Stock move activities
         cr.execute("""
             SELECT sml.reference, 'حركة مخزون' as type, sml.date as date,
                    rp.name as user, sml.state, sml.quantity
@@ -1219,20 +1377,25 @@ class PosReportsApi(models.Model):
             for r in all_activities
         ]
 
-        return {"summary": summary, "columns": columns, "rows": rows}
+        result = {"summary": summary, "columns": columns, "rows": rows}
+        log.log_result('_report_activity_log', 'total_activities', total_activities)
+        log.log_end('_report_activity_log')
+        return result
 
     # ---------------------------------------------------------------
     # 18. Late Payments Report
     # ---------------------------------------------------------------
     @api.model
     def _report_late_payments(self, date_from, date_to, **kw):
+        log = ReportQueryLogger()
+        log.log_start('_report_late_payments', date_from, date_to, **kw)
         today = date.today()
         _cids = self._get_allowed_companies()
         cr = self.env.cr
+        self.env.cr.commit()
 
         company_domain = [('company_id', 'in', tuple(_cids))] if _cids else []
 
-        # Overdue vendor bills
         bill_domain = [
             ('move_type', '=', 'in_invoice'),
             ('state', '=', 'posted'),
@@ -1260,7 +1423,6 @@ class PosReportsApi(models.Model):
                 'days': days_overdue,
             })
 
-        # Overdue purchase orders (confirmed but not fully received)
         po_domain = [
             ('state', '=', 'purchase'),
             ('receipt_status', 'in', ('pending', 'partial')),
@@ -1301,8 +1463,6 @@ class PosReportsApi(models.Model):
             })
 
         all_items = bill_items + po_items
-
-        # Summary cards
         total_overdue = len(all_items)
         total_amount = sum(i['amount'] for i in all_items)
         buckets = defaultdict(int)
@@ -1318,7 +1478,6 @@ class PosReportsApi(models.Model):
             {"label": "أوامر شراء متأخرة", "value": str(len(po_items)), "icon": "clipboard_list", "color": "tertiary"},
         ]
 
-        # Chart: aging buckets bar
         chart = {
             "type": "bar",
             "labels": ['0-30 يوم', '30-60 يوم', '60-90 يوم', 'أكثر من 90 يوم'],
@@ -1345,7 +1504,11 @@ class PosReportsApi(models.Model):
               "amount": float(i['amount'])} for i in po_items]
         )
 
-        return {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        result = {"summary": summary, "chart": chart, "columns": columns, "rows": rows}
+        log.log_result('_report_late_payments', 'total_overdue', total_overdue)
+        log.log_result('_report_late_payments', 'total_amount', total_amount)
+        log.log_end('_report_late_payments')
+        return result
 
     # ---------------------------------------------------------------
     # Open Sessions (for close-session dropdown)
@@ -1413,6 +1576,14 @@ class PosReportsApi(models.Model):
     # ---------------------------------------------------------------
     @api.model
     def get_report_data(self, report_type, date_from=None, date_to=None, filters=None):
+        _logger.info(
+            "REPORT ENTRY | type=%s | date_from=%s | date_to=%s | filters=%s | timestamp=%s",
+            report_type, date_from, date_to,
+            json.dumps(filters or {}, default=_serialize),
+            datetime.utcnow().isoformat(),
+        )
+        # Commit any pending writes to ensure report reads latest data
+        self.env.cr.commit()
         method_map = {
             "profit_loss": "_report_profit_loss",
             "purchases_sales": "_report_purchases_sales",
@@ -1437,6 +1608,7 @@ class PosReportsApi(models.Model):
         }
         method_name = method_map.get(report_type)
         if not method_name:
+            _logger.error("REPORT UNKNOWN | type=%s", report_type)
             return {"error": f"Unknown report type: {report_type}"}
         method = getattr(self, method_name)
         return method(date_from, date_to, **filters)

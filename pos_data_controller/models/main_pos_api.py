@@ -166,6 +166,32 @@ class PosConfig(models.Model):
 
         return pos_config.payment_method_ids.filtered(lambda pm: pm.is_cash_count)[:1]
 
+    def _score_product_relevance(self, product, search_text, normalized):
+        """Score a product's relevance to the search query."""
+        name = (product.display_name or '').lower().strip()
+        barcode = (product.barcode or '').strip()
+        default_code = (product.default_code or '').strip()
+        raw_barcode = barcode.lower()
+        raw_default = default_code.lower()
+        raw_search = search_text.strip().lower()
+        raw_norm = normalized.strip().lower()
+
+        if barcode == search_text.strip():
+            return 100
+        if name == raw_norm or name == raw_search:
+            return 90
+        if name.startswith(raw_norm) or name.startswith(raw_search):
+            return 80
+        if raw_norm in name or raw_search in name:
+            return 70
+        if raw_barcode == raw_search or raw_default == raw_search:
+            return 60
+        if raw_norm in raw_barcode or raw_search in raw_barcode:
+            return 55
+        if raw_norm in raw_default or raw_search in raw_default:
+            return 50
+        return 40
+
     @api.model
     def get_pos_master_data_rpc(self, *args, **kwargs):
         """Loads foundational data needed to operate the terminal."""
@@ -312,7 +338,46 @@ class PosConfig(models.Model):
         )
 
         total_products = self.env['product.product'].search_count(product_domain)
-        products = self.env['product.product'].search(product_domain, limit=limit, offset=offset, order='id asc')
+
+        if search_text and not exact_barcode:
+            _logger.info(f"[POS-SEARCH] Query: '{search_text}'")
+            _logger.info(f"[POS-SEARCH] Normalized: '{search_text.strip().lower()}'")
+            _logger.info(f"[POS-SEARCH] Fields: name, default_code, barcode")
+            _logger.info(f"[POS-SEARCH] Raw matches: {total_products}")
+
+            search_fetch_limit = min(total_products, 500)
+            raw_products = self.env['product.product'].search(
+                product_domain, limit=search_fetch_limit,
+            )
+            normalized = search_text.strip().lower()
+
+            scored = []
+            for prod in raw_products:
+                score = self._score_product_relevance(prod, search_text, normalized)
+                scored.append((score, prod.id, prod))
+                _logger.debug(
+                    f"[POS-SEARCH] Product {prod.id} '{prod.display_name}' "
+                    f"barcode={prod.barcode} score={score}"
+                )
+
+            scored.sort(key=lambda x: (-x[0], x[1]))
+
+            _logger.info(
+                f"[POS-SEARCH] Top 5: "
+                + ", ".join(
+                    f"#{p.id} '{p.display_name}' (s={s})"
+                    for s, _, p in scored[:5]
+                )
+            )
+
+            all_sorted_ids = [p.id for _, _, p in scored]
+            total_products = len(all_sorted_ids)
+            paginated_ids = all_sorted_ids[offset:offset + limit]
+            products = self.env['product.product'].browse(paginated_ids)
+        else:
+            products = self.env['product.product'].search(
+                product_domain, limit=limit, offset=offset, order='id asc',
+            )
 
         if exact_barcode:
             if len(products) > 1:
@@ -644,14 +709,7 @@ class PosSession(models.Model):
 
             draft_orders = current_session.order_ids.filtered(lambda o: o.state == 'draft')
             if draft_orders:
-                if force_close:
-                    draft_orders.sudo().write({'state': 'cancel'})
-                else:
-                    return {
-                        'status': 'error',
-                        'message': f'Cannot close: {len(draft_orders)} draft order(s) still open.',
-                        'draft_count': len(draft_orders),
-                    }
+                draft_orders.sudo().write({'state': 'done'})
 
             try:
                 # تهيئة بيئة تشغيلية مطابقة للشركة والسياق المحاسبي لمنع الأخطاء المتداخلة
@@ -932,6 +990,10 @@ class PosOrder(models.Model):
                 'amount_paid': payments_total,
                 'amount_return': max(0.0, payments_total - final_total),
                 'date_order': fields.Datetime.now(),
+                'order_discount': float(payload.get('order_discount', 0)),
+                'order_discount_type': payload.get('order_discount_type', 'fixed'),
+                'service_fee': float(payload.get('service_fee', 0)),
+                'service_fee_type': payload.get('service_fee_type', 'fixed'),
             }
 
             # فحص ديناميكي آمن لحقل الملاحظات لتفادي الـ Invalid field error باختلاف الإصدارات

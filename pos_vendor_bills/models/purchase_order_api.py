@@ -270,7 +270,9 @@ class PurchaseOrderApi(models.AbstractModel):
         _cids = self.env.context.get('allowed_company_ids', [])
         if _cids and po.company_id.id not in _cids:
             return {'success': False, 'message': 'Purchase order not found in this company'}
-        if po.state not in ('draft', 'sent', 'purchase'):
+        pre_state = po.state
+        is_done_edit = po.state == 'done'
+        if po.state not in ('draft', 'sent', 'purchase', 'done'):
             return {'success': False, 'message': f'Cannot edit PO in state: {po.state}'}
 
         try:
@@ -281,6 +283,59 @@ class PurchaseOrderApi(models.AbstractModel):
             new_state = payload.get('state')
             new_receipt_status = payload.get('receipt_status')
 
+            # --- Safety Checks for done state edits ---
+            if is_done_edit and lines_data:
+                existing_lines = {ol.id: ol for ol in po.order_line}
+                incoming_ids = {int(ld.get('id')) for ld in lines_data if ld.get('id')}
+                for ld in lines_data:
+                    lid = ld.get('id')
+                    if not lid:
+                        continue
+                    lid = int(lid)
+                    ol = existing_lines.get(lid)
+                    if not ol:
+                        continue
+                    new_product_id = ld.get('product_id')
+                    if new_product_id and int(new_product_id) != ol.product_id.id:
+                        if ol.qty_received or ol.qty_invoiced:
+                            return {'success': False, 'message': (
+                                'لا يمكن تغيير المنتج في بند تم استلامه أو فوترته بالفعل. '
+                                'قم بإنشاء بند جديد بدلاً من ذلك.'
+                            )}
+                    if 'price_unit' in ld:
+                        new_price = float(ld.get('price_unit', 0))
+                        if abs(new_price - ol.price_unit) > 0.001 and ol.qty_invoiced:
+                            return {'success': False, 'message': (
+                                'لا يمكن تغيير سعر الشراء في بند تمت فوترته بالفعل.'
+                            )}
+                # Check deletion safety
+                to_remove_ids = {lid for lid in existing_lines.keys()} - incoming_ids
+                for lid in to_remove_ids:
+                    ol = existing_lines[lid]
+                    if ol.qty_received or ol.qty_invoiced:
+                        return {'success': False, 'message': (
+                            'لا يمكن حذف بند تم استلامه أو فوترته بالفعل. '
+                            f'المنتج: {ol.product_id.display_name}'
+                        )}
+
+            # --- Capture pre-change state for logging ---
+            pre_header = {
+                'partner_id': po.partner_id.id if po.partner_id else None,
+                'date_order': str(po.date_order) if po.date_order else None,
+                'notes': po.notes or '',
+            }
+            pre_lines = {}
+            for ol in po.order_line:
+                pre_lines[ol.id] = {
+                    'product_id': ol.product_id.id if ol.product_id else None,
+                    'product_name': ol.product_id.display_name if ol.product_id else '',
+                    'product_qty': ol.product_qty,
+                    'price_unit': ol.price_unit,
+                    'qty_received': ol.qty_received,
+                    'qty_invoiced': ol.qty_invoiced,
+                    'taxes_id': ol.taxes_id.ids,
+                }
+
             header_vals = {}
             if partner_id:
                 header_vals['partner_id'] = int(partner_id)
@@ -290,20 +345,33 @@ class PurchaseOrderApi(models.AbstractModel):
             if header_vals:
                 po.write(header_vals)
 
+            # --- Collect affected picking/invoice IDs (before line changes) ---
+            affected_picking_ids = set()
+            affected_invoice_ids = set()
+            if is_done_edit:
+                for ol in po.order_line:
+                    for m in ol.move_ids:
+                        if m.picking_id:
+                            affected_picking_ids.add(m.picking_id.id)
+                    for invl in ol.invoice_lines:
+                        if invl.move_id and invl.move_id.state != 'cancel':
+                            affected_invoice_ids.add(invl.move_id.id)
+
             if lines_data:
                 existing_ids = set(po.order_line.ids)
                 sent_ids = set()
                 line_commands = []
+                modified_line_ids = set()
 
-                for line in lines_data:
-                    product_id = line.get('product_id')
+                for ld in lines_data:
+                    product_id = ld.get('product_id')
                     if not product_id:
                         continue
-                    quantity = float(line.get('quantity', 1))
-                    price_unit = float(line.get('price_unit', 0))
-                    list_price = float(line.get('list_price', 0))
-                    name = line.get('name', '')
-                    tax_ids = line.get('tax_ids', [])
+                    quantity = float(ld.get('quantity', 1))
+                    price_unit = float(ld.get('price_unit', 0))
+                    list_price = float(ld.get('list_price', 0))
+                    name = ld.get('name', '')
+                    tax_ids = ld.get('tax_ids', [])
 
                     product = self.env['product.product'].browse(int(product_id))
                     if not name:
@@ -321,36 +389,38 @@ class PurchaseOrderApi(models.AbstractModel):
                         'date_planned': fields.Datetime.now(),
                     }
 
-                    line_id = line.get('id')
+                    line_id = ld.get('id')
                     if line_id:
                         sent_ids.add(int(line_id))
+                        modified_line_ids.add(int(line_id))
                         line_commands.append((1, int(line_id), line_vals))
                     else:
                         line_commands.append((0, 0, line_vals))
 
                 to_remove = existing_ids - sent_ids
                 for lid in to_remove:
+                    modified_line_ids.discard(lid)
                     line_commands.append((2, lid))
 
                 if line_commands:
                     po.write({'order_line': line_commands})
 
-                for line in lines_data:
-                    product_id = line.get('product_id')
+                for ld in lines_data:
+                    product_id = ld.get('product_id')
                     if not product_id:
                         continue
                     product = self.env['product.product'].browse(int(product_id))
                     product.write({
-                        'standard_price': float(line.get('price_unit', 0)),
-                        'list_price': float(line.get('list_price', 0)),
+                        'standard_price': float(ld.get('price_unit', 0)),
+                        'list_price': float(ld.get('list_price', 0)),
                     })
 
-                    po_line_id = int(line.get('id')) if line.get('id') else None
+                    po_line_id = int(ld.get('id')) if ld.get('id') else None
                     po_line = self.env['purchase.order.line'].browse(po_line_id) if po_line_id else po.order_line.filtered(
                         lambda l: l.product_id.id == int(product_id)
                     )[:1]
                     if po_line:
-                        allocations_data = line.get('location_allocations', [])
+                        allocations_data = ld.get('location_allocations', [])
                         po_line.location_allocations.unlink()
                         for alloc in allocations_data:
                             self.env['purchase.order.line.location'].create({
@@ -358,6 +428,98 @@ class PurchaseOrderApi(models.AbstractModel):
                                 'location_id': alloc['location_id'],
                                 'quantity': alloc['quantity'],
                             })
+
+            # --- Log all changes ---
+            try:
+                log_changes = []
+                post_header = {
+                    'partner_id': po.partner_id.id if po.partner_id else None,
+                    'date_order': str(po.date_order) if po.date_order else None,
+                    'notes': po.notes or '',
+                }
+                for field in ['partner_id', 'date_order', 'notes']:
+                    if pre_header.get(field) != post_header.get(field):
+                        log_changes.append({
+                            'field_name': field,
+                            'previous_value': pre_header.get(field, ''),
+                            'new_value': post_header.get(field, ''),
+                            'change_type': 'header',
+                        })
+
+                post_lines = {}
+                for ol in po.order_line:
+                    post_lines[ol.id] = {
+                        'product_id': ol.product_id.id if ol.product_id else None,
+                        'product_name': ol.product_id.display_name if ol.product_id else '',
+                        'product_qty': ol.product_qty,
+                        'price_unit': ol.price_unit,
+                        'qty_received': ol.qty_received,
+                        'qty_invoiced': ol.qty_invoiced,
+                        'taxes_id': ol.taxes_id.ids,
+                    }
+
+                # Lines that were added
+                for ol in po.order_line:
+                    if ol.id not in pre_lines:
+                        log_changes.append({
+                            'field_name': 'order_line',
+                            'previous_value': '',
+                            'new_value': f"Added: {ol.product_id.display_name} qty={ol.product_qty} price={ol.price_unit}",
+                            'change_type': 'line_add',
+                            'line': ol,
+                        })
+
+                # Lines that were removed
+                for ol_id, pre_ol in pre_lines.items():
+                    if ol_id not in post_lines:
+                        log_changes.append({
+                            'field_name': 'order_line',
+                            'previous_value': f"Removed: {pre_ol['product_name']} qty={pre_ol['product_qty']} price={pre_ol['price_unit']}",
+                            'new_value': '',
+                            'change_type': 'line_remove',
+                        })
+
+                # Lines that were updated
+                for ol in po.order_line:
+                    pre_ol = pre_lines.get(ol.id)
+                    if not pre_ol:
+                        continue
+                    po_ol = post_lines[ol.id]
+                    for fld in ['product_qty', 'price_unit']:
+                        if pre_ol.get(fld) != po_ol.get(fld):
+                            log_changes.append({
+                                'field_name': fld,
+                                'previous_value': pre_ol.get(fld, ''),
+                                'new_value': po_ol.get(fld, ''),
+                                'change_type': 'line_update',
+                                'line': ol,
+                            })
+                    if pre_ol.get('product_id') != po_ol.get('product_id'):
+                        log_changes.append({
+                            'field_name': 'product_id',
+                            'previous_value': pre_ol.get('product_name', ''),
+                            'new_value': ol.product_id.display_name,
+                            'change_type': 'line_update',
+                            'line': ol,
+                        })
+
+                # Log state changes
+                if new_state and new_state != pre_state:
+                    log_changes.append({
+                        'field_name': 'state',
+                        'previous_value': pre_state,
+                        'new_value': new_state,
+                        'change_type': 'state_change',
+                    })
+
+                if log_changes:
+                    self.env['purchase.order.change.log'].log_batch_changes(
+                        po, log_changes,
+                        picking_ids=affected_picking_ids,
+                        invoice_ids=affected_invoice_ids,
+                    )
+            except Exception as log_e:
+                _logger.error("Failed to log PO changes for %s (id=%s): %s", po.name, po.id, log_e)
 
             if new_state and new_state != po.state:
                 if new_state == 'purchase' and po.state == 'draft':
@@ -412,8 +574,14 @@ class PurchaseOrderApi(models.AbstractModel):
                     po.write({'state': 'draft'})
                 elif new_state == 'sent':
                     po.write({'state': 'sent'})
-                elif new_state == 'done':
-                    po.write({'state': 'done'})
+                elif new_state == 'done' and po.state == 'purchase':
+                    po.button_done()
+                elif new_state == 'purchase' and po.state == 'done':
+                    try:
+                        po.button_unlock()
+                    except Exception:
+                        _logger.warning("Unlock failed for PO %s, user may lack manager permission", po.id)
+                        return {'success': False, 'message': 'فشل إلغاء القفل. تأكد من أن لديك صلاحيات المدير.'}
 
             return {
                 'success': True,

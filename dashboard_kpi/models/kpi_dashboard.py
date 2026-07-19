@@ -1,5 +1,8 @@
-from odoo import models, api
+import logging
 from datetime import datetime, timezone, timedelta
+from odoo import models, api
+
+_logger = logging.getLogger(__name__)
 
 
 class KpiDashboard(models.Model):
@@ -12,7 +15,6 @@ class KpiDashboard(models.Model):
         return cids or self.env.user.company_ids.ids
 
     def _parse_date(self, value, fallback):
-        """Ensure date is valid YYYY-MM-DD string"""
         if not value:
             return fallback
         try:
@@ -22,44 +24,50 @@ class KpiDashboard(models.Model):
 
     @api.model
     def get_kpis(self, date_from=None, date_to=None):
-        # 1. Define Cairo Timezone (UTC+2)
+        _logger.info(
+            "KPI START | date_from=%s | date_to=%s | timestamp=%s",
+            date_from, date_to, datetime.utcnow().isoformat(),
+        )
         cairo_tz = timezone(timedelta(hours=2))
         cairo_now = datetime.now(cairo_tz)
         today_str = cairo_now.strftime('%Y-%m-%d')
-        # Default to first day of current month
-        month_start_str = cairo_now.replace(day=1).strftime('%Y-%m-%d')
+        now_str = cairo_now.strftime('%Y-%m-%d %H:%M:%S')
 
-        # 2. Parse inputs: If empty or None, fallback to THIS MONTH
-        date_from = self._parse_date(date_from, month_start_str)
+        date_from = self._parse_date(date_from, today_str)
         date_to = self._parse_date(date_to, today_str)
 
-        # Build date boundaries for ORM (handles timezone automatically)
         dt_from = f"{date_from} 00:00:00"
-        dt_to = f"{date_to} 23:59:59"
+        if date_from == today_str and date_to == today_str:
+            dt_to = now_str
+        else:
+            dt_to = f"{date_to} 23:59:59"
         d_from = date_from
         d_to = date_to
 
-        # 1. Revenue - ORM query includes both POS orders and Sales Orders
-        _company_ids = self._get_allowed_companies()
-        pos_domain = [
-            ('state', 'in', ('paid', 'done', 'invoiced')),
-            ('date_order', '>=', dt_from),
-            ('date_order', '<=', dt_to),
-            ('company_id', 'in', _company_ids),
-        ]
-        so_domain = [
-            ('state', 'in', ('sale', 'done')),
-            ('date_order', '>=', dt_from),
-            ('date_order', '<=', dt_to),
-            ('company_id', 'in', _company_ids),
-        ]
+        self.env.cr.commit()  # ensure latest data
 
-        pos_revenue = sum(self.env['pos.order'].search(pos_domain).mapped('amount_total'))
-        so_revenue = sum(self.env['sale.order'].search(so_domain).mapped('amount_total'))
+        _company_ids = self._get_allowed_companies()
+        _logger.info("KPI PARAMS | date_from=%s | date_to=%s | dt_from=%s | dt_to=%s | companies=%s", date_from, date_to, dt_from, dt_to, _company_ids)
+
+        # Revenue via SQL to avoid ORM cache
+        cr = self.env.cr
+        cr.execute("""
+            SELECT COALESCE(SUM(amount_total), 0) FROM pos_order
+            WHERE state IN ('paid', 'done', 'invoiced')
+              AND date_order >= %s AND date_order <= %s
+              AND company_id IN %s
+        """, (dt_from, dt_to, tuple(_company_ids)))
+        pos_revenue = float(cr.fetchone()[0])
+
+        cr.execute("""
+            SELECT COALESCE(SUM(amount_total), 0) FROM sale_order
+            WHERE state IN ('sale', 'done')
+              AND date_order >= %s AND date_order <= %s
+              AND company_id IN %s
+        """, (dt_from, dt_to, tuple(_company_ids)))
+        so_revenue = float(cr.fetchone()[0])
         total_revenue = pos_revenue + so_revenue
 
-        # 2. Expenses - use SQL for aggregation performance
-        cr = self.env.cr
         cr.execute("""
             SELECT COALESCE(SUM(aml.debit - aml.credit), 0)
             FROM account_move_line aml
@@ -72,7 +80,6 @@ class KpiDashboard(models.Model):
         """, (d_from, d_to, tuple(_company_ids)))
         total_expenses = cr.fetchone()[0] or 0
 
-        # 3. Low Stock
         cr.execute("""
             SELECT COUNT(*)
             FROM stock_quant sq
@@ -84,7 +91,6 @@ class KpiDashboard(models.Model):
         """, (tuple(_company_ids),))
         low_stock_count = cr.fetchone()[0] or 0
 
-        # 4. Customers
         cr.execute("""
             SELECT COUNT(*)
             FROM res_partner
@@ -93,7 +99,7 @@ class KpiDashboard(models.Model):
         """, (tuple(_company_ids),))
         total_customers = cr.fetchone()[0] or 0
 
-        return {
+        result = {
             'date_from': date_from,
             'date_to': date_to,
             'total_revenue': float(total_revenue),
@@ -101,61 +107,76 @@ class KpiDashboard(models.Model):
             'low_stock_count': int(low_stock_count),
             'total_customers': int(total_customers),
         }
+
+        _logger.info(
+            "KPI RESULT | revenue=%s | expenses=%s | low_stock=%s | customers=%s",
+            total_revenue, total_expenses, low_stock_count, total_customers,
+        )
+        return result
     
     @api.model
     def get_storage_kpi(self):
+        _logger.info("KPI STORAGE START | timestamp=%s", datetime.utcnow().isoformat())
         _company_ids = self._get_allowed_companies()
         cr = self.env.cr
+        self.env.cr.commit()
         company = self.env.company
+
         cr.execute("""
-    SELECT COALESCE(SUM(sq.quantity * COALESCE((pp.standard_price->>%(company_id)s)::double precision, 0.0)), 0)
-    FROM stock_quant sq
-    JOIN product_product pp ON pp.id = sq.product_id
-    JOIN stock_location sl ON sl.id = sq.location_id
-    WHERE sl.usage = 'internal'
-      AND sq.product_id NOT IN (1, 2, 3)
-      AND sl.company_id IN %(company_ids)s
-""", {'company_id': str(company.id), 'company_ids': tuple(_company_ids)})
+            SELECT COALESCE(SUM(sq.quantity * COALESCE((pp.standard_price->>%(company_id)s)::double precision, 0.0)), 0)
+            FROM stock_quant sq
+            JOIN product_product pp ON pp.id = sq.product_id
+            JOIN stock_location sl ON sl.id = sq.location_id
+            WHERE sl.usage = 'internal'
+              AND sq.product_id NOT IN (1, 2, 3)
+              AND sl.company_id IN %(company_ids)s
+        """, {'company_id': str(company.id), 'company_ids': tuple(_company_ids)})
         inventory_value = cr.fetchone()[0] or 0
         
         cr.execute("""
-        SELECT COUNT(*)
-        FROM product_product pp
-        WHERE pp.id NOT IN (1, 2, 3)
-          AND pp.id NOT IN (
-            SELECT product_id
-            FROM stock_quant sq
-            JOIN stock_location sl ON sl.id = sq.location_id
-            WHERE sl.usage = 'internal' AND sq.quantity > 0
-              AND sl.company_id IN %s
-        )
+            SELECT COUNT(*)
+            FROM product_product pp
+            WHERE pp.id NOT IN (1, 2, 3)
+              AND pp.id NOT IN (
+                SELECT product_id
+                FROM stock_quant sq
+                JOIN stock_location sl ON sl.id = sq.location_id
+                WHERE sl.usage = 'internal' AND sq.quantity > 0
+                  AND sl.company_id IN %s
+            )
         """, (tuple(_company_ids),))
         out_of_stock = cr.fetchone()[0] or 0
 
         cr.execute("""
-        SELECT COALESCE(SUM(sq.quantity), 0)
-        FROM stock_quant sq
-        JOIN stock_location sl ON sl.id = sq.location_id
-        WHERE sl.usage = 'internal'
-          AND sq.product_id NOT IN (1, 2, 3)
-          AND sl.company_id IN %s
+            SELECT COALESCE(SUM(sq.quantity), 0)
+            FROM stock_quant sq
+            JOIN stock_location sl ON sl.id = sq.location_id
+            WHERE sl.usage = 'internal'
+              AND sq.product_id NOT IN (1, 2, 3)
+              AND sl.company_id IN %s
         """, (tuple(_company_ids),))
         total_quantity = cr.fetchone()[0] or 0
 
         cr.execute("""
-        SELECT COUNT(*)
-        FROM stock_picking
-        WHERE state IN ('confirmed', 'assigned', 'waiting')
-        AND picking_type_id IN (
-            SELECT id FROM stock_picking_type WHERE code = 'incoming'
-        )
-        AND company_id IN %s
+            SELECT COUNT(*)
+            FROM stock_picking
+            WHERE state IN ('confirmed', 'assigned', 'waiting')
+            AND picking_type_id IN (
+                SELECT id FROM stock_picking_type WHERE code = 'incoming'
+            )
+            AND company_id IN %s
         """, (tuple(_company_ids),))
         incoming_shipments = cr.fetchone()[0] or 0
-        
-        return {
+
+        result = {
             'inventory_value': float(inventory_value),
             'out_of_stock': int(out_of_stock),
             'total_quantity': int(total_quantity),
             'incoming_shipments': int(incoming_shipments),
         }
+
+        _logger.info(
+            "KPI STORAGE RESULT | inventory_value=%s | out_of_stock=%s | total_qty=%s | incoming=%s",
+            inventory_value, out_of_stock, total_quantity, incoming_shipments,
+        )
+        return result

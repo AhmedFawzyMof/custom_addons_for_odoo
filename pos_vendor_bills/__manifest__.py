@@ -4,6 +4,7 @@
     'category': 'Point of Sale / Purchase',
     'depends': [
         'purchase',
+        'purchase_stock',
         'account',
         'stock',
         'base',
