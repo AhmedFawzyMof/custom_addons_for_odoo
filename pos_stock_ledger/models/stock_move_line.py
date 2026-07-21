@@ -1,4 +1,5 @@
 import math
+import pytz
 from odoo import models, fields, api
 
 class StockMoveLine(models.Model):
@@ -97,9 +98,27 @@ class StockMoveLine(models.Model):
             if selected_usage == 'internal' and (src_usage != 'internal' or dest_usage != 'internal'):
                 continue
 
-            # Datetime Localized Parsing
+            # Egypt Timezone Conversion
             dt_field = fields.Datetime.from_string(line.date)
-            local_dt = fields.Datetime.context_timestamp(self, dt_field) if self.env.user else dt_field
+            cairo_tz = pytz.timezone('Africa/Cairo')
+            local_dt = pytz.utc.localize(dt_field).astimezone(cairo_tz)
+
+            # Determine source document type
+            picking = line.picking_id
+            origin = ''
+            if picking:
+                if picking.sale_id:
+                    origin = 'طلب بيع (RPC)'
+                elif picking.purchase_id:
+                    origin = 'أمر شراء (PO)'
+                elif picking.origin and 'جرد' in picking.origin:
+                    origin = 'جرد مخزني'
+                elif picking.origin:
+                    origin = picking.origin
+                else:
+                    origin = 'تحويل داخلي'
+            else:
+                origin = 'إدخال يدوي'
 
             formatted_movements.append({
                 'id': line.picking_id.name or line.reference or f"ST-LV-{line.id}",
@@ -107,17 +126,18 @@ class StockMoveLine(models.Model):
                 'time': local_dt.strftime('%H:%M:%S'),
                 'productName': line.product_id.display_name,
                 'sku': line.product_id.default_code or '',
-                'type': move_type,              # Matches frontend condition ('incoming' | 'outgoing' | 'transfer')
-                'typeLabel': direction,         # Arabic Label matching your style
+                'type': move_type,
+                'typeLabel': direction,
+                'origin': origin,
                 'fromLocation': src_name,
                 'toLocation': dest_name,
                 'fromUsage': src_usage,
                 'toUsage': dest_usage,
-                'qty': calculated_qty,          # Evaluated number with positive/negative mathematical assignment
+                'qty': calculated_qty,
                 'operator': line.create_uid.name or 'النظام',
                 'status': 'done',
                 'statusLabel': 'مكتمل',
-                'badgeColor': badge_color,      # Passes your custom styling strings down seamlessly
+                'badgeColor': badge_color,
                 'reference': line.reference or line.picking_id.name or '',
                 'notes': line.move_id.description_picking or ''
             })
