@@ -105,7 +105,7 @@ class PosReportsApi(models.Model):
             return {}
         cr = self.env.cr
         if model == 'product.template':
-            sql = "SELECT id, COALESCE(%s, name) FROM product_template WHERE id IN %%s" % name_field
+            sql = "SELECT id, name FROM product_template WHERE id IN %s"
         elif model == 'account.tax':
             sql = "SELECT id, name FROM account_tax WHERE id IN %%s"
         elif model == 'account.account':
