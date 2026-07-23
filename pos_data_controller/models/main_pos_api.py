@@ -96,11 +96,12 @@ class PosConfig(models.Model):
                 WHERE pos_payment_method_id IN %s
             """, (tuple(duplicated_cash_methods.ids),))
 
-        # 4. تعريف محدد ومحمي للثلاث طرق المطلوبة فقط
+        # 4. تعريف محدد ومحمي للاربع طرق المطلوبة فقط
         required_methods = [
             {'key': 'cash',     'name': 'نقدي',         'journal_id': cash_journal.id if cash_journal else False, 'existing_record': cash_method},
             {'key': 'bank',     'name': 'بطاقة',        'journal_id': bank_journal.id if bank_journal else False, 'existing_record': False},
             {'key': 'customer', 'name': 'حساب العميل', 'journal_id': False,                                      'existing_record': False},
+            {'key': 'transfer', 'name': 'تحويل بنكي',   'journal_id': bank_journal.id if bank_journal else False, 'existing_record': False},
         ]
 
         methods_to_link = []
@@ -119,6 +120,11 @@ class PosConfig(models.Model):
                         ('name', '=', method_def['name']),
                         ('company_id', '=', company_id),
                         ('journal_id', '=', False)
+                    ], limit=1)
+                elif method_def['key'] == 'transfer':
+                    existing = self.env['pos.payment.method'].search([
+                        ('name', '=', method_def['name']),
+                        ('company_id', '=', company_id),
                     ], limit=1)
 
             # إذا لم تكن طريقة الدفع موجودة نهائياً، قم بإنشائها
@@ -144,7 +150,7 @@ class PosConfig(models.Model):
             if existing:
                 methods_to_link.append(existing.id)
 
-        # 5. التحديث الصارم والنهائي لطرق الدفع المسموحة للجهاز (3 طرق فقط لا غير)
+        # 5. التحديث الصارم والنهائي لطرق الدفع المسموحة للجهاز (4 طرق فقط لا غير)
         if methods_to_link:
             # نتأكد أن المصفوفة تحتوي على عناصر فريدة بدون تكرار بالخطأ
             methods_to_link = list(set(methods_to_link))
