@@ -170,8 +170,6 @@ class PosReportsApi(models.Model):
         """, (dt_from, dt_to, tuple(_cids)))
         total_loss = float(cr.fetchone()[0])
 
-        total_discounts_loss = total_discounts + total_loss
-
         cr.execute("""
             SELECT CASE
                 WHEN pj.type = 'cash' THEN 'cash'
@@ -207,30 +205,32 @@ class PosReportsApi(models.Model):
         expense_rows = cr.fetchall()
         total_expenses = sum(r[1] for r in expense_rows) or 0.0
 
-        cogs = 0.0
-        if self._table_exists('stock_valuation_layer'):
-            cr.execute("""
-                SELECT COALESCE(SUM(svl.value), 0)
-                FROM stock_valuation_layer svl
-                JOIN stock_move sm ON sm.id = svl.stock_move_id
-                WHERE sm.date >= %s AND sm.date <= %s
-                  AND svl.description LIKE '%%[POS]%%'
-                  AND sm.company_id IN %s
-            """, (d_from, d_to, tuple(_cids)))
-            cogs = float(cr.fetchone()[0])
+        company_id = str(self.env.company.id)
+        cr.execute("""
+            SELECT COALESCE(SUM(pol.qty * COALESCE(
+                (pp.standard_price->>%s)::double precision,
+                0.0
+            )), 0)
+            FROM pos_order_line pol
+            JOIN pos_order po ON po.id = pol.order_id
+            JOIN product_product pp ON pp.id = pol.product_id
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+        """, (company_id, dt_from, dt_to, tuple(_cids)))
+        cogs = float(cr.fetchone()[0])
 
         gross_profit = total_revenue - cogs
-        net_profit = gross_profit - total_expenses
+        net_profit = gross_profit - total_discounts - total_loss - total_expenses
 
         summary = [
             {"label": "إجمالي الإيرادات", "value": f"{total_revenue:,.2f}", "icon": "trending_up", "color": "primary"},
-            {"label": "الخصومات (خسارة)", "value": f"{total_discounts_loss:,.2f}", "icon": "tag", "color": "error"},
+            {"label": "الخصومات", "value": f"{total_discounts:,.2f}", "icon": "file_warning", "color": "error"},
+            {"label": "الخسائر", "value": f"{total_loss:,.2f}", "icon": "receipt", "color": "error"},
             {"label": "تكلفة البضاعة", "value": f"{cogs:,.2f}", "icon": "shopping_cart", "color": "tertiary"},
             {"label": "إجمالي الربح", "value": f"{gross_profit:,.2f}", "icon": "account_balance_wallet", "color": "secondary"},
+            {"label": "المصروفات", "value": f"{total_expenses:,.2f}", "icon": "banknote", "color": "error"},
             {"label": "صافي الربح", "value": f"{net_profit:,.2f}", "icon": "payments", "color": "primary" if net_profit >= 0 else "error"},
-            {"label": "إجمالي النقدي", "value": f"{cash_total:,.2f}", "icon": "cash", "color": "success"},
-            {"label": "إجمالي البطاقة", "value": f"{card_total:,.2f}", "icon": "credit_card", "color": "primary"},
-            {"label": "حساب العميل", "value": f"{account_total:,.2f}", "icon": "users", "color": "tertiary"},
         ]
 
         cr.execute("""
@@ -255,14 +255,69 @@ class PosReportsApi(models.Model):
         """, (d_from, d_to, tuple(_cids)))
         monthly_expenses = dict(cr.fetchall())
 
-        all_months = sorted(set(list(monthly_revenue.keys()) + list(monthly_expenses.keys())))
+        cr.execute("""
+            SELECT TO_CHAR(po.date_order, 'YYYY-MM'),
+                   COALESCE(SUM(pol.price_unit * pol.qty * pol.discount / 100.0), 0)
+            FROM pos_order_line pol
+            JOIN pos_order po ON po.id = pol.order_id
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+            GROUP BY 1 ORDER BY 1
+        """, (dt_from, dt_to, tuple(_cids)))
+        monthly_discounts = dict(cr.fetchall())
+
+        cr.execute("""
+            SELECT TO_CHAR(po.date_order, 'YYYY-MM'),
+                   COALESCE(SUM(po.amount_total - po.amount_paid), 0)
+            FROM pos_order po
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+            GROUP BY 1 ORDER BY 1
+        """, (dt_from, dt_to, tuple(_cids)))
+        monthly_losses = dict(cr.fetchall())
+
+        cr.execute("""
+            SELECT TO_CHAR(po.date_order, 'YYYY-MM'),
+                   COALESCE(SUM(pol.qty * COALESCE(
+                       (pp.standard_price->>%s)::double precision,
+                       0.0
+                   )), 0)
+            FROM pos_order_line pol
+            JOIN pos_order po ON po.id = pol.order_id
+            JOIN product_product pp ON pp.id = pol.product_id
+            WHERE po.state IN ('paid', 'done', 'invoiced')
+              AND po.date_order >= %s AND po.date_order <= %s
+              AND po.company_id IN %s
+            GROUP BY 1 ORDER BY 1
+        """, (company_id, dt_from, dt_to, tuple(_cids)))
+        monthly_cogs = {r[0]: float(r[1]) for r in cr.fetchall()}
+
+        all_months = sorted(set(
+            list(monthly_revenue.keys())
+            + list(monthly_expenses.keys())
+            + list(monthly_discounts.keys())
+            + list(monthly_losses.keys())
+            + list(monthly_cogs.keys())
+        ))
 
         chart = {
             "type": "bar",
             "labels": all_months,
             "datasets": [
                 {"label": "الإيرادات", "data": [float(monthly_revenue.get(m, 0)) for m in all_months]},
+                {"label": "تكلفة البضاعة", "data": [float(monthly_cogs.get(m, 0)) for m in all_months]},
                 {"label": "المصروفات", "data": [float(monthly_expenses.get(m, 0)) for m in all_months]},
+                {"label": "صافي الربح", "type": "line", "data": [
+                    float(
+                        monthly_revenue.get(m, 0)
+                        - monthly_cogs.get(m, 0)
+                        - monthly_discounts.get(m, 0)
+                        - monthly_losses.get(m, 0)
+                        - monthly_expenses.get(m, 0)
+                    ) for m in all_months
+                ]},
             ],
         }
 
@@ -272,6 +327,8 @@ class PosReportsApi(models.Model):
         ]
         rows = [
             {"category": "الإيرادات", "amount": total_revenue},
+            {"category": "الخصومات", "amount": total_discounts},
+            {"category": "الخسائر", "amount": total_loss},
             {"category": "تكلفة البضاعة", "amount": cogs},
             {"category": "إجمالي الربح", "amount": gross_profit},
             {"category": "المصروفات", "amount": total_expenses},
@@ -1060,7 +1117,6 @@ class PosReportsApi(models.Model):
               AND po.company_id IN %s
         """, (dt_from, dt_to, tuple(_cids)))
         total_loss = float(cr.fetchone()[0])
-        total_discounts = total_discounts + total_loss
 
         cr.execute("""
             SELECT CASE
@@ -1102,6 +1158,7 @@ class PosReportsApi(models.Model):
             {"label": "عدد الطلبات", "value": str(total_orders), "icon": "receipt", "color": "primary"},
             {"label": "إجمالي المبيعات", "value": f"{total_amount:,.2f}", "icon": "trending_up", "color": "secondary"},
             {"label": "إجمالي الخصومات", "value": f"{total_discounts:,.2f}", "icon": "tag", "color": "error"},
+            {"label": "إجمالي الخسائر", "value": f"{total_loss:,.2f}", "icon": "file_warning", "color": "error"},
             {"label": "إجمالي النقدي", "value": f"{cash_total:,.2f}", "icon": "cash", "color": "success"},
             {"label": "إجمالي البطاقة", "value": f"{card_total:,.2f}", "icon": "credit_card", "color": "primary"},
             {"label": "حساب العميل", "value": f"{account_total:,.2f}", "icon": "users", "color": "tertiary"},
