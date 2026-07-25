@@ -223,6 +223,13 @@ class PosReportsApi(models.Model):
         gross_profit = total_revenue - cogs
         net_profit = gross_profit - total_discounts - total_loss - total_expenses
 
+        _logger.info(
+            "PROFIT DEBUG | date_from=%s | date_to=%s | revenue=%s | cogs=%s | discounts=%s | losses=%s | expenses=%s | gross=%s | net=%s",
+            date_from, date_to,
+            total_revenue, cogs, total_discounts, total_loss, total_expenses,
+            gross_profit, net_profit,
+        )
+
         summary = [
             {"label": "إجمالي الإيرادات", "value": f"{total_revenue:,.2f}", "icon": "trending_up", "color": "primary"},
             {"label": "الخصومات", "value": f"{total_discounts:,.2f}", "icon": "file_warning", "color": "error"},
