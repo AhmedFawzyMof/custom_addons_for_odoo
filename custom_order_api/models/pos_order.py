@@ -14,3 +14,7 @@ class PosOrder(models.Model):
         ('fixed', 'Fixed'),
         ('percent', 'Percentage'),
     ], string='Service Fee Type', default='fixed')
+    source = fields.Selection([
+        ('pos', 'POS'),
+        ('callcenter', 'Call Center'),
+    ], string='Order Source', default='pos', help='Origin of the order')

@@ -1000,6 +1000,7 @@ class PosOrder(models.Model):
                 'order_discount_type': payload.get('order_discount_type', 'fixed'),
                 'service_fee': float(payload.get('service_fee', 0)),
                 'service_fee_type': payload.get('service_fee_type', 'fixed'),
+                'source': payload.get('source', 'pos'),
             }
 
             # فحص ديناميكي آمن لحقل الملاحظات لتفادي الـ Invalid field error باختلاف الإصدارات

@@ -38,6 +38,7 @@ class CustomOrderApi(models.AbstractModel):
         date_from   = kwargs.get('date_from')
         date_to     = kwargs.get('date_to')
         session_id  = kwargs.get('session_id')
+        source      = kwargs.get('source')
 
         STATUS_MAP = {
             'draft':     'draft',
@@ -53,6 +54,9 @@ class CustomOrderApi(models.AbstractModel):
         if status and status.lower() not in ('all', ''):
             odoo_state = STATUS_MAP.get(status.lower(), status)
             domain.append(('state', '=', odoo_state))
+
+        if source:
+            domain.append(('source', '=', source))
 
         if date_from:
             domain.append(('date_order', '>=', date_from))
@@ -100,6 +104,7 @@ class CustomOrderApi(models.AbstractModel):
                 'service_fee': order.service_fee or 0.0,
                 'service_fee_type': order.service_fee_type or 'fixed',
                 'note': order.general_note or '',
+                'source': order.source or 'pos',
             })
 
         return {
