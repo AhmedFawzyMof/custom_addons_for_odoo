@@ -181,12 +181,16 @@ class CustomOrderApi(models.AbstractModel):
             order.general_note,
         )
 
+        partner = order.partner_id
         return {
             'id': order.id,
             'name': order.pos_reference or order.name,
             'date_order': order.date_order.isoformat() if order.date_order else False,
             'state': order.state,
-            'partner_id': [order.partner_id.id, order.partner_id.name] if order.partner_id else False,
+            'partner_id': [partner.id, partner.name] if partner else False,
+            'partner_phone': (partner.phone or partner.mobile or '') if partner else '',
+            'partner_email': (partner.email or '') if partner else '',
+            'partner_address': ', '.join(filter(None, [partner.street, partner.street2, partner.city])) if partner else '',
             'user_id': [order.user_id.id, order.user_id.name] if order.user_id else False,
             'session_id': [order.session_id.id, order.session_id.name] if order.session_id else False,
             'amount_total': order.amount_total,
