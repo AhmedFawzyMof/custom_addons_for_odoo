@@ -1050,6 +1050,7 @@ class PosReportsApi(models.Model):
             JOIN res_partner rp ON rp.id = po.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+              AND po.state IN ('purchase', 'done')
             ORDER BY po.date_order DESC
             LIMIT 200
         """, (d_from, d_to, tuple(_cids)))
@@ -1156,6 +1157,7 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_partner u ON u.id = ru.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+              AND po.state IN ('paid', 'done', 'invoiced')
             ORDER BY po.date_order DESC
             LIMIT 200
         """, (dt_from, dt_to, tuple(_cids)))
@@ -1399,6 +1401,7 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_partner rp ON rp.id = ru.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+              AND po.state IN ('paid', 'done', 'invoiced')
             ORDER BY po.date_order DESC
             LIMIT 100
         """, (dt_from, dt_to, tuple(_cids)))
