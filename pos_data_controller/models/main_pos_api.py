@@ -27,148 +27,155 @@ class PosConfig(models.Model):
     @api.model
     def _ensure_payment_methods_before_open(self, config_id_int):
         """
-        تضمن هذه الدالة وجود 3 طرق دفع فريدة فقط (نقدي، بطاقة، حساب العميل) وربطها بالجهاز.
-        تقوم بتنظيف قاعدة البيانات فورياً من أي طرق دفع كاش مكررة أو زائدة وتمنع ظهور 4 طرق دفع تماماً.
+        يضمن وجود 4 طرق دفع (نقدي، بطاقة، حساب العميل، تحويل بنكي) وربطها بالجهاز.
+        النقدي لكل جهاز دفتر يومية خاص (Odoo يمنع مشاركة طريقة دفع نقدي بين أكثر من جهاز).
         """
         pos_config = self.browse(config_id_int)
         if not pos_config.exists():
             return None
 
-        # 1. إذا كانت هناك جلسة نشطة، نكتفي بإرجاع الكاش المرتبط منعاً لأخطاء الحسابات
+        # 1. إذا كانت هناك جلسة نشطة، لا يمكن تعديل طرق الدفع، نكتفي بالإرجاع
         active_session = self.env['pos.session'].search([
             ('config_id', '=', config_id_int),
             ('state', 'in', ['opened', 'closing_control', 'opening_control'])
         ], limit=1)
-        
+
         if active_session:
             return pos_config.payment_method_ids.filtered(lambda pm: pm.is_cash_count)[:1]
 
         company_id  = pos_config.company_id.id
         config_name = pos_config.name
+        pm_env      = self.env['pos.payment.method']
 
-        # 2. جلب أو إنشاء دفاتر اليومية (Journals) بشكل آمن
-        cash_journal = self.env['account.journal'].search([
-            ('type', '=', 'cash'),
-            ('company_id', '=', company_id)
-        ], limit=1)
+        # 2. النقدي: دفتر يومية + طريقة دفع خاصة بهذا الجهاز فقط
+        # (قيود Odoo: طريقة الدفع النقدي لا يمكن ربطها بأكثر من جهاز،
+        #  والدفتر النقدي لا يمكن مشاركته بين طريقتين نقديتين)
+        cash_method = pos_config.payment_method_ids.filtered(lambda pm: pm.is_cash_count)[:1]
 
-        if not cash_journal:
-            sp = 'sp_create_cash_journal'
-            self.env.cr.execute(f'SAVEPOINT "{sp}"')
-            try:
-                cash_journal = self.env['account.journal'].sudo().create({
-                    'name':       f'نقدي - {config_name}',
-                    'type':       'cash',
-                    'company_id': company_id,
-                    'code':       ('CSH%s' % config_id_int)[:5],
-                })
-                self.env.cr.execute(f'RELEASE SAVEPOINT "{sp}"')
-            except Exception as e:
-                self.env.cr.execute(f'ROLLBACK TO SAVEPOINT "{sp}"')
-                _logger.error(f"Failed to create cash journal: {e}")
-                cash_journal = False
+        if not cash_method or not cash_method.journal_id:
+            # دفتر يومية نقدي حر (غير مرتبط بأي طريقة دفع حالياً)
+            cash_journal = self.env['account.journal'].search([
+                ('type', '=', 'cash'),
+                ('company_id', '=', company_id),
+                ('pos_payment_method_ids', '=', False),
+            ], limit=1)
+
+            if not cash_journal:
+                sp = 'sp_create_cash_journal'
+                self.env.cr.execute(f'SAVEPOINT "{sp}"')
+                try:
+                    cash_journal = self.env['account.journal'].sudo().create({
+                        'name':       f'نقدي - {config_name}',
+                        'type':       'cash',
+                        'company_id': company_id,
+                        'code':       ('C' + str(config_id_int).zfill(4))[:5],
+                    })
+                    self.env.cr.execute(f'RELEASE SAVEPOINT "{sp}"')
+                except Exception as e:
+                    self.env.cr.execute(f'ROLLBACK TO SAVEPOINT "{sp}"')
+                    _logger.error(f"Failed to create cash journal: {e}")
+                    cash_journal = False
+
+            if cash_journal:
+                cash_method = pm_env.search([
+                    ('company_id', '=', company_id),
+                    ('journal_id', '=', cash_journal.id),
+                    ('is_cash_count', '=', True),
+                ], limit=1)
+
+                if not cash_method:
+                    sp2 = 'sp_create_cash_pm'
+                    self.env.cr.execute(f'SAVEPOINT "{sp2}"')
+                    try:
+                        cash_method = pm_env.sudo().create({
+                            'name':          'نقدي',
+                            'company_id':    company_id,
+                            'journal_id':    cash_journal.id,
+                            'is_cash_count': True,
+                        })
+                        self.env.cr.execute(f'RELEASE SAVEPOINT "{sp2}"')
+                    except Exception as e:
+                        self.env.cr.execute(f'ROLLBACK TO SAVEPOINT "{sp2}"')
+                        _logger.error(f"Failed to create cash payment method: {e}")
+                        cash_method = False
 
         bank_journal = self.env['account.journal'].search([
             ('type', '=', 'bank'),
             ('company_id', '=', company_id)
         ], limit=1)
 
-        # 3. إيجاد وتصفية طرق الدفع النقدية (الكاش) لمنع التكرار نهائياً
-        # نبحث عن أي طريقة دفع كاش بالشركة سواء باسم "نقدي" أو "Cash" أو مرتبطة بدفتر كاش
-        all_cash_methods = self.env['pos.payment.method'].search([
-            ('company_id', '=', company_id),
-            '|', '|', 
-            ('journal_id.type', '=', 'cash'),
-            ('name', '=ilike', 'نقدي%'),
-            ('name', '=ilike', 'cash%')
-        ])
-
-        # نختار سجل واحد رئيسي ليكون هو الكاش المعتمد
-        cash_method = all_cash_methods[:1]
-        
-        # ⚠️ خطوة الحماية المروعة: إذا كان هناك كاش مكرر وزائد (أكثر من 1)، نقوم بفصله وإزالته من الـ Config تماماً
-        duplicated_cash_methods = charities = all_cash_methods[1:]
-        if duplicated_cash_methods:
-            _logger.info(f"Cleaning duplicated cash payment methods for company {company_id}: {duplicated_cash_methods.ids}")
-            # نقوم بإزالتهم بشكل مباشر من إعدادات نقاط البيع عبر استعلام قاعدة البيانات لضمان اختفائهم
-            self.env.cr.execute("""
-                DELETE FROM pos_config_pos_payment_method_rel 
-                WHERE pos_payment_method_id IN %s
-            """, (tuple(duplicated_cash_methods.ids),))
-
-        # 4. تعريف محدد ومحمي للاربع طرق المطلوبة فقط
+        # 3. تعريف طرق الدفع الأربع المطلوبة
         required_methods = [
-            {'key': 'cash',     'name': 'نقدي',         'journal_id': cash_journal.id if cash_journal else False, 'existing_record': cash_method},
-            {'key': 'bank',     'name': 'بطاقة',        'journal_id': bank_journal.id if bank_journal else False, 'existing_record': False},
-            {'key': 'customer', 'name': 'حساب العميل', 'journal_id': False,                                      'existing_record': False},
-            {'key': 'transfer', 'name': 'تحويل بنكي',   'journal_id': bank_journal.id if bank_journal else False, 'existing_record': False},
+            {'key': 'cash',     'name': 'نقدي',         'journal_id': cash_method.journal_id.id if cash_method and cash_method.journal_id else False, 'existing_record': cash_method},
+            {'key': 'bank',     'name': 'بطاقة',        'journal_id': bank_journal.id if bank_journal else False,                                  'existing_record': False},
+            {'key': 'customer', 'name': 'حساب العميل', 'journal_id': False,                                                                          'existing_record': False},
+            {'key': 'transfer', 'name': 'تحويل بنكي',   'journal_id': bank_journal.id if bank_journal else False,                                  'existing_record': False},
         ]
 
         methods_to_link = []
 
         for method_def in required_methods:
             existing = method_def['existing_record']
-            
+
             if not existing:
                 if method_def['key'] == 'bank' and method_def['journal_id']:
-                    existing = self.env['pos.payment.method'].search([
+                    existing = pm_env.search([
                         ('journal_id', '=', method_def['journal_id']),
                         ('company_id', '=', company_id)
                     ], limit=1)
                 elif method_def['key'] == 'customer':
-                    existing = self.env['pos.payment.method'].search([
+                    existing = pm_env.search([
                         ('name', '=', method_def['name']),
                         ('company_id', '=', company_id),
                         ('journal_id', '=', False)
                     ], limit=1)
                 elif method_def['key'] == 'transfer':
-                    existing = self.env['pos.payment.method'].search([
+                    existing = pm_env.search([
                         ('name', '=', method_def['name']),
                         ('company_id', '=', company_id),
                     ], limit=1)
 
-            # إذا لم تكن طريقة الدفع موجودة نهائياً، قم بإنشائها
+            # إنشاء طريقة الدفع إذا لم تكن موجودة
             if not existing:
                 create_vals = {'name': method_def['name'], 'company_id': company_id}
                 if method_def['journal_id']:
                     create_vals['journal_id'] = method_def['journal_id']
-                
+
                 sp2 = 'sp_create_pm'
                 self.env.cr.execute(f'SAVEPOINT "{sp2}"')
                 try:
-                    existing = self.env['pos.payment.method'].sudo().create(create_vals)
+                    existing = pm_env.sudo().create(create_vals)
                     self.env.cr.execute(f'RELEASE SAVEPOINT "{sp2}"')
                 except Exception as e:
                     self.env.cr.execute(f'ROLLBACK TO SAVEPOINT "{sp2}"')
                     _logger.error(f"Failed to create payment method '{method_def['name']}': {e}")
                     continue
 
-            # إذا كانت طريقة الكاش الرئيسية تفتقد لربط اليومية، نقوم بإصلاحها فوراً
-            if method_def['key'] == 'cash' and existing and not existing.journal_id and method_def['journal_id']:
-                existing.sudo().write({'journal_id': method_def['journal_id']})
-
             if existing:
                 methods_to_link.append(existing.id)
 
-        # 5. التحديث الصارم والنهائي لطرق الدفع المسموحة للجهاز (4 طرق فقط لا غير)
+        # 4. التحديث النهائي لطرق الدفع المسموحة للجهاز (4 طرق فقط)
+        # ملاحظة: لا نحذف الصفوف يدوياً قبل الكتابة، فأمر SET (6,0) يستبدل القائمة كاملة.
         if methods_to_link:
-            # نتأكد أن المصفوفة تحتوي على عناصر فريدة بدون تكرار بالخطأ
             methods_to_link = list(set(methods_to_link))
-            
+
             sp3 = 'sp_link_pm'
             self.env.cr.execute(f'SAVEPOINT "{sp3}"')
             try:
-                # مسح كامل للجدول الوسيط الخاص بالربط لهذا الجهاز أولاً لضمان تصفير الطرق القديمة
-                self.env.cr.execute(
-                    "DELETE FROM pos_config_pos_payment_method_rel WHERE pos_config_id = %s", 
-                    (config_id_int,)
-                )
-                # إعادة ربط الطرق الـ 3 الصحيحة فقط
-                pos_config.sudo().write({'payment_method_ids': [(6, 0, methods_to_link)]})
+                pos_config.sudo().with_context(
+                    bypass_payment_method_ids_forbidden_change=True
+                ).write({'payment_method_ids': [(6, 0, methods_to_link)]})
                 self.env.cr.execute(f'RELEASE SAVEPOINT "{sp3}"')
             except Exception as e:
                 self.env.cr.execute(f'ROLLBACK TO SAVEPOINT "{sp3}"')
-                _logger.error(f"Failed to refresh payment methods on config: {e}")
+                _logger.error(f"Failed to refresh payment methods on config {config_id_int}: {e}", exc_info=True)
+
+            # تحقق بعد الكتابة: إذا لم تُربط الطرق، سجل خطأ واضحاً بدلاً من صمت.
+            linked = pos_config.payment_method_ids.ids
+            if set(linked) != set(methods_to_link):
+                _logger.error(
+                    f"VERIFY-FAIL config {config_id_int}: expected {methods_to_link} got {linked}"
+                )
 
         return pos_config.payment_method_ids.filtered(lambda pm: pm.is_cash_count)[:1]
 
@@ -220,6 +227,8 @@ class PosConfig(models.Model):
         pos_config = self.browse(config_id_int)
         if not pos_config.exists():
             return {'status': 'error', 'message': 'POS Config not found'}
+
+        self._ensure_payment_methods_before_open(config_id_int)
 
         config_company_id = pos_config.company_id.id
 
@@ -515,6 +524,7 @@ class PosConfig(models.Model):
                 values['warehouse_id'] = warehouse.id
 
             new_config = self.create(values)
+            self._ensure_payment_methods_before_open(new_config.id)
             self.env.cr.execute('RELEASE SAVEPOINT sp_create_register')
             return {
                 'status':  'success',
@@ -957,6 +967,27 @@ class PosOrder(models.Model):
                         'price_subtotal_incl': service_fee,
                     }))
 
+            # معالجة تكلفة التوصيل (إن وجدت) كبند خدمة مستقل
+            delivery_cost = float(payload.get('delivery_cost', 0))
+            delivery_line_added = False
+            if delivery_cost > 0:
+                delivery_product = self.env['product.product'].search([
+                    ('type', '=', 'service'),
+                    ('available_in_pos', '=', True)
+                ], limit=1)
+                if delivery_product:
+                    order_lines.append((0, 0, {
+                        'product_id': delivery_product.id,
+                        'qty': 1,
+                        'price_unit': delivery_cost,
+                        'discount': 0,
+                        'price_subtotal': delivery_cost,
+                        'price_subtotal_incl': delivery_cost,
+                    }))
+                    delivery_line_added = True
+            if not delivery_line_added:
+                delivery_cost = 0.0
+
             # 3. إعداد مصفوفة طرق الدفع للطلب وحساب إجمالي المدفوعات
             order_payments = []
             payments_total = 0.0
@@ -978,7 +1009,7 @@ class PosOrder(models.Model):
             if order_discount_type == 'percent' and total_order_subtotal > 0:
                 order_discount = (order_discount / 100.0) * total_order_subtotal
             
-            final_total = total_order_subtotal + (service_fee if service_fee > 0 else 0) - order_discount
+            final_total = total_order_subtotal + (service_fee if service_fee > 0 else 0) + delivery_cost - order_discount
             if final_total < 0:
                 final_total = 0.0
             # taxes computed server-side by _compute_prices() during action_pos_order_paid()
@@ -1041,6 +1072,9 @@ class PosOrder(models.Model):
             
             if hasattr(new_order, '_create_order_picking'):
                 new_order._create_order_picking()
+                driver_id = int(payload.get('driver_id') or 0)
+                if driver_id:
+                    new_order.picking_ids.write({'driver_id': driver_id})
             elif hasattr(new_order, 'create_picking'):
                 new_order.create_picking()
 

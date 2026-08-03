@@ -132,23 +132,36 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()  # ensure latest committed data
 
+        order_id = kw.get('order_id')
+        order_filter = ""
+        order_filter_params = ()
+        pos_date_filter = " AND po.date_order >= %s AND po.date_order <= %s"
+        pos_date_filter_params = (dt_from, dt_to)
+        if order_id:
+            order_filter = " AND po.id = %s"
+            order_filter_params = (int(order_id),)
+            pos_date_filter = ""
+            pos_date_filter_params = ()
+
         cr.execute("""
             SELECT COALESCE(SUM(po.amount_total), 0)
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
-        """, (dt_from, dt_to, tuple(_cids)))
+        """ + order_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         pos_revenue = float(cr.fetchone()[0])
 
-        cr.execute("""
-            SELECT COALESCE(SUM(so.amount_total), 0)
-            FROM sale_order so
-            WHERE so.state IN ('sale', 'done')
-              AND so.date_order >= %s AND so.date_order <= %s
-              AND so.company_id IN %s
-        """, (dt_from, dt_to, tuple(_cids)))
-        so_revenue = float(cr.fetchone()[0])
+        so_revenue = 0.0
+        if not order_id:
+            cr.execute("""
+                SELECT COALESCE(SUM(so.amount_total), 0)
+                FROM sale_order so
+                WHERE so.state IN ('sale', 'done')
+                  AND so.date_order >= %s AND so.date_order <= %s
+                  AND so.company_id IN %s
+            """, (dt_from, dt_to, tuple(_cids)))
+            so_revenue = float(cr.fetchone()[0])
         total_revenue = pos_revenue + so_revenue
 
         cr.execute("""
@@ -156,18 +169,18 @@ class PosReportsApi(models.Model):
             FROM pos_order_line pol
             JOIN pos_order po ON po.id = pol.order_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
-        """, (dt_from, dt_to, tuple(_cids)))
+        """ + order_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         total_discounts = float(cr.fetchone()[0])
 
         cr.execute("""
             SELECT COALESCE(SUM(po.amount_total - po.amount_paid), 0)
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
-        """, (dt_from, dt_to, tuple(_cids)))
+        """ + order_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         total_loss = float(cr.fetchone()[0])
 
         cr.execute("""
@@ -182,28 +195,32 @@ class PosReportsApi(models.Model):
             JOIN pos_payment_method ppm ON ppm.id = pp.payment_method_id
             LEFT JOIN account_journal pj ON pj.id = ppm.journal_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
+        """ + order_filter + """
             GROUP BY payment_type
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         payment_totals = dict(cr.fetchall())
         cash_total = payment_totals.get('cash', 0.0)
         card_total = payment_totals.get('bank', 0.0)
         account_total = payment_totals.get('pay_later', 0.0)
 
-        cr.execute("""
-            SELECT aa.name, COALESCE(SUM(aml.debit - aml.credit), 0) as amount
-            FROM account_move_line aml
-            JOIN account_account aa ON aa.id = aml.account_id
-            WHERE aml.date >= %s AND aml.date <= %s
-              AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
-              AND aml.parent_state = 'posted'
-              AND aml.company_id IN %s
-            GROUP BY aa.name
-            ORDER BY amount DESC
-        """, (d_from, d_to, tuple(_cids)))
-        expense_rows = cr.fetchall()
-        total_expenses = sum(r[1] for r in expense_rows) or 0.0
+        expense_rows = []
+        total_expenses = 0.0
+        if not order_id:
+            cr.execute("""
+                SELECT aa.name, COALESCE(SUM(aml.debit - aml.credit), 0) as amount
+                FROM account_move_line aml
+                JOIN account_account aa ON aa.id = aml.account_id
+                WHERE aml.date >= %s AND aml.date <= %s
+                  AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
+                  AND aml.parent_state = 'posted'
+                  AND aml.company_id IN %s
+                GROUP BY aa.name
+                ORDER BY amount DESC
+            """, (d_from, d_to, tuple(_cids)))
+            expense_rows = cr.fetchall()
+            total_expenses = sum(r[1] for r in expense_rows) or 0.0
 
         company_id = str(self.env.company.id)
         cr.execute("""
@@ -215,9 +232,9 @@ class PosReportsApi(models.Model):
             JOIN pos_order po ON po.id = pol.order_id
             JOIN product_product pp ON pp.id = pol.product_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
-        """, (company_id, dt_from, dt_to, tuple(_cids)))
+        """ + order_filter, (company_id,) + pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         cogs = float(cr.fetchone()[0])
 
         gross_profit = total_revenue - cogs
@@ -244,23 +261,26 @@ class PosReportsApi(models.Model):
             SELECT TO_CHAR(po.date_order, 'YYYY-MM') as month, SUM(po.amount_total)
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
+        """ + order_filter + """
             GROUP BY month ORDER BY month
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         monthly_revenue = dict(cr.fetchall())
 
-        cr.execute("""
-            SELECT TO_CHAR(aml.date, 'YYYY-MM'), COALESCE(SUM(aml.debit - aml.credit), 0)
-            FROM account_move_line aml
-            JOIN account_account aa ON aa.id = aml.account_id
-            WHERE aml.date >= %s AND aml.date <= %s
-              AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
-              AND aml.parent_state = 'posted'
-              AND aml.company_id IN %s
-            GROUP BY TO_CHAR(aml.date, 'YYYY-MM') ORDER BY 1
-        """, (d_from, d_to, tuple(_cids)))
-        monthly_expenses = dict(cr.fetchall())
+        monthly_expenses = {}
+        if not order_id:
+            cr.execute("""
+                SELECT TO_CHAR(aml.date, 'YYYY-MM'), COALESCE(SUM(aml.debit - aml.credit), 0)
+                FROM account_move_line aml
+                JOIN account_account aa ON aa.id = aml.account_id
+                WHERE aml.date >= %s AND aml.date <= %s
+                  AND aa.account_type IN ('expense', 'expense_depreciation', 'expense_direct_cost')
+                  AND aml.parent_state = 'posted'
+                  AND aml.company_id IN %s
+                GROUP BY TO_CHAR(aml.date, 'YYYY-MM') ORDER BY 1
+            """, (d_from, d_to, tuple(_cids)))
+            monthly_expenses = dict(cr.fetchall())
 
         cr.execute("""
             SELECT TO_CHAR(po.date_order, 'YYYY-MM'),
@@ -268,10 +288,11 @@ class PosReportsApi(models.Model):
             FROM pos_order_line pol
             JOIN pos_order po ON po.id = pol.order_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
+        """ + order_filter + """
             GROUP BY 1 ORDER BY 1
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         monthly_discounts = dict(cr.fetchall())
 
         cr.execute("""
@@ -279,10 +300,11 @@ class PosReportsApi(models.Model):
                    COALESCE(SUM(po.amount_total - po.amount_paid), 0)
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
+        """ + order_filter + """
             GROUP BY 1 ORDER BY 1
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         monthly_losses = dict(cr.fetchall())
 
         cr.execute("""
@@ -295,10 +317,11 @@ class PosReportsApi(models.Model):
             JOIN pos_order po ON po.id = pol.order_id
             JOIN product_product pp ON pp.id = pol.product_id
             WHERE po.state IN ('paid', 'done', 'invoiced')
-              AND po.date_order >= %s AND po.date_order <= %s
+        """ + pos_date_filter + """
               AND po.company_id IN %s
+        """ + order_filter + """
             GROUP BY 1 ORDER BY 1
-        """, (company_id, dt_from, dt_to, tuple(_cids)))
+        """, (company_id,) + pos_date_filter_params + (tuple(_cids),) + order_filter_params)
         monthly_cogs = {r[0]: float(r[1]) for r in cr.fetchall()}
 
         all_months = sorted(set(

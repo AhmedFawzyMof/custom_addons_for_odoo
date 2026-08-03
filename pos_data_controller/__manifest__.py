@@ -4,7 +4,9 @@
     'category': 'Point of Sale',
     'depends': [
         'point_of_sale', 
-        'stock'
+        'stock',
+        'delivery',
+        'delivery_driver'
     ],
     'data': [
         'views/pos_config_views.xml',
