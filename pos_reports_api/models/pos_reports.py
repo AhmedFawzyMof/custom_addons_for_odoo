@@ -143,13 +143,20 @@ class PosReportsApi(models.Model):
             pos_date_filter = ""
             pos_date_filter_params = ()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT COALESCE(SUM(po.amount_total), 0)
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """ + order_filter + config_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         pos_revenue = float(cr.fetchone()[0])
 
         so_revenue = 0.0
@@ -171,7 +178,7 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """ + order_filter + config_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         total_discounts = float(cr.fetchone()[0])
 
         cr.execute("""
@@ -180,7 +187,7 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """ + order_filter + config_filter, pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         total_loss = float(cr.fetchone()[0])
 
         cr.execute("""
@@ -197,9 +204,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter + """
+        """ + order_filter + config_filter + """
             GROUP BY payment_type
-        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         payment_totals = dict(cr.fetchall())
         cash_total = payment_totals.get('cash', 0.0)
         card_total = payment_totals.get('bank', 0.0)
@@ -234,7 +241,7 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter, (company_id,) + pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """ + order_filter + config_filter, (company_id,) + pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         cogs = float(cr.fetchone()[0])
 
         gross_profit = total_revenue - cogs
@@ -263,9 +270,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter + """
+        """ + order_filter + config_filter + """
             GROUP BY month ORDER BY month
-        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         monthly_revenue = dict(cr.fetchall())
 
         monthly_expenses = {}
@@ -290,9 +297,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter + """
+        """ + order_filter + config_filter + """
             GROUP BY 1 ORDER BY 1
-        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         monthly_discounts = dict(cr.fetchall())
 
         cr.execute("""
@@ -302,9 +309,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter + """
+        """ + order_filter + config_filter + """
             GROUP BY 1 ORDER BY 1
-        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """, pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         monthly_losses = dict(cr.fetchall())
 
         cr.execute("""
@@ -319,9 +326,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
         """ + pos_date_filter + """
               AND po.company_id IN %s
-        """ + order_filter + """
+        """ + order_filter + config_filter + """
             GROUP BY 1 ORDER BY 1
-        """, (company_id,) + pos_date_filter_params + (tuple(_cids),) + order_filter_params)
+        """, (company_id,) + pos_date_filter_params + (tuple(_cids),) + order_filter_params + config_filter_params)
         monthly_cogs = {r[0]: float(r[1]) for r in cr.fetchall()}
 
         all_months = sorted(set(
@@ -384,6 +391,13 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT TO_CHAR(po.date_order, 'YYYY-MM'), COALESCE(SUM(po.amount_total), 0)
             FROM purchase_order po
@@ -400,8 +414,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
             GROUP BY 1 ORDER BY 1
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         monthly_sales = dict(cr.fetchall())
 
         total_purchases = sum(monthly_purchases.values())
@@ -451,6 +466,13 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT at.id, at.name, COALESCE(SUM(po.amount_tax), 0)
             FROM pos_order po
@@ -460,8 +482,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
             GROUP BY at.id, at.name ORDER BY 3 DESC
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         tax_rows = cr.fetchall()
 
         total_tax = sum(r[2] for r in tax_rows) or 0.0
@@ -519,6 +542,13 @@ class PosReportsApi(models.Model):
         """, (tuple(_cids),))
         total_customers = cr.fetchone()[0] or 0
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT rp.name, COALESCE(SUM(po.amount_total), 0) as total
             FROM res_partner rp
@@ -539,8 +569,9 @@ class PosReportsApi(models.Model):
               AND po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
             GROUP BY rp.name ORDER BY total DESC LIMIT 10
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         top_customers = cr.fetchall()
 
         summary = [
@@ -820,6 +851,13 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT pt.id, pt.name, COALESCE(SUM(pol.qty), 0) as total_qty,
                    COALESCE(SUM(pol.price_subtotal_incl), 0) as total_revenue
@@ -830,10 +868,11 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
             GROUP BY pt.id, pt.name
             ORDER BY total_qty DESC
             LIMIT 20
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         top_products = cr.fetchall()
 
         total_qty = sum(r[2] for r in top_products)
@@ -1007,6 +1046,13 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT pt.id, pt.name,
                    COALESCE(SUM(pol.qty), 0) as total_qty,
@@ -1018,10 +1064,11 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
             GROUP BY pt.id, pt.name
             ORDER BY total_qty DESC
             LIMIT 20
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         product_rows = cr.fetchall()
 
         total_revenue = sum(r[3] for r in product_rows)
@@ -1119,13 +1166,21 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT COUNT(*), COALESCE(SUM(po.amount_total), 0)
             FROM pos_order po
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
-        """, (dt_from, dt_to, tuple(_cids)))
+        """ + config_filter + """
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         row = cr.fetchone()
         total_orders = row[0] or 0
         total_amount = float(row[1] or 0.0)
@@ -1137,7 +1192,8 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
-        """, (dt_from, dt_to, tuple(_cids)))
+        """ + config_filter + """
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         total_discounts = float(cr.fetchone()[0])
 
         cr.execute("""
@@ -1146,7 +1202,8 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
-        """, (dt_from, dt_to, tuple(_cids)))
+        """ + config_filter + """
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         total_loss = float(cr.fetchone()[0])
 
         cr.execute("""
@@ -1163,8 +1220,9 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
             GROUP BY payment_type
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         payment_totals = dict(cr.fetchall())
         cash_total = payment_totals.get('cash', 0.0)
         card_total = payment_totals.get('bank', 0.0)
@@ -1180,10 +1238,11 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_partner u ON u.id = ru.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
               AND po.state IN ('paid', 'done', 'invoiced')
             ORDER BY po.date_order DESC
             LIMIT 200
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         sale_rows = cr.fetchall()
 
         summary = [
@@ -1285,6 +1344,13 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND ps.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT ps.id, ps.name, pc.name as register, rp.name as user,
                    ps.start_at, ps.stop_at, ps.state,
@@ -1296,9 +1362,10 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_partner rp ON rp.id = ru.partner_id
             WHERE ps.start_at >= %s AND (ps.stop_at <= %s OR ps.stop_at IS NULL)
               AND pc.company_id IN %s
+        """ + config_filter + """
             ORDER BY ps.start_at DESC
             LIMIT 200
-        """, (tuple(_cids), dt_from, dt_to, tuple(_cids)))
+        """, (tuple(_cids), dt_from, dt_to, tuple(_cids)) + config_filter_params)
         session_rows = cr.fetchall()
 
         total_sessions = len(session_rows)
@@ -1356,6 +1423,13 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT rp.name as salesperson,
                    COUNT(*) as order_count,
@@ -1367,9 +1441,10 @@ class PosReportsApi(models.Model):
             WHERE po.state IN ('paid', 'done', 'invoiced')
               AND po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
             GROUP BY rp.name
             ORDER BY total_sales DESC
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         sp_rows = cr.fetchall()
 
         total_sales = sum(r[2] for r in sp_rows) or 0.0
@@ -1416,6 +1491,13 @@ class PosReportsApi(models.Model):
         cr = self.env.cr
         self.env.cr.commit()
 
+        config_id = kw.get('config_id')
+        config_filter = ""
+        config_filter_params = ()
+        if config_id:
+            config_filter = " AND po.config_id = %s"
+            config_filter_params = (int(config_id),)
+
         cr.execute("""
             SELECT po.name, 'طلب بيع' as type, po.date_order as date,
                    rp.name as user, po.state, po.amount_total
@@ -1424,10 +1506,11 @@ class PosReportsApi(models.Model):
             LEFT JOIN res_partner rp ON rp.id = ru.partner_id
             WHERE po.date_order >= %s AND po.date_order <= %s
               AND po.company_id IN %s
+        """ + config_filter + """
               AND po.state IN ('paid', 'done', 'invoiced')
             ORDER BY po.date_order DESC
             LIMIT 100
-        """, (dt_from, dt_to, tuple(_cids)))
+        """, (dt_from, dt_to, tuple(_cids)) + config_filter_params)
         order_activities = cr.fetchall()
 
         cr.execute("""
