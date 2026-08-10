@@ -111,7 +111,7 @@ class PurchaseOrderApi(models.AbstractModel):
                 'qty_received': line.qty_received,
                 'qty_invoiced': line.qty_invoiced,
                 'price_unit': line.price_unit,
-                'list_price': line.product_id.list_price if line.product_id else 0.0,
+                'list_price': line.list_price or (line.product_id.list_price if line.product_id else 0.0),
                 'price_subtotal': line.price_subtotal,
                 'price_total': line.price_total,
                 'date_planned': line.date_planned.strftime('%Y-%m-%d') if line.date_planned else '',
@@ -208,6 +208,7 @@ class PurchaseOrderApi(models.AbstractModel):
                 'name': name,
                 'product_qty': quantity,
                 'price_unit': price_unit,
+                'list_price': float(line.get('list_price', 0)),
                 'price_subtotal': quantity * price_unit,
                 'product_uom': product.uom_po_id.id if product.uom_po_id.category_id == product.uom_id.category_id else product.uom_id.id,
                 'taxes_id': tax_ids if isinstance(tax_ids, list) else [(6, 0, tax_ids)],
@@ -247,6 +248,8 @@ class PurchaseOrderApi(models.AbstractModel):
                         'location_id': alloc['location_id'],
                         'quantity': alloc['quantity'],
                     })
+
+            po._sync_product_prices_from_lines()
 
             return {
                 'success': True,
@@ -384,6 +387,7 @@ class PurchaseOrderApi(models.AbstractModel):
                         'name': name,
                         'product_qty': quantity,
                         'price_unit': price_unit,
+                        'list_price': list_price,
                         'product_uom': product.uom_po_id.id if product.uom_po_id.category_id == product.uom_id.category_id else product.uom_id.id,
                         'taxes_id': tax_command,
                         'date_planned': fields.Datetime.now(),
@@ -405,15 +409,12 @@ class PurchaseOrderApi(models.AbstractModel):
                 if line_commands:
                     po.write({'order_line': line_commands})
 
+                po._sync_product_prices_from_lines()
+
                 for ld in lines_data:
                     product_id = ld.get('product_id')
                     if not product_id:
                         continue
-                    product = self.env['product.product'].browse(int(product_id))
-                    product.write({
-                        'standard_price': float(ld.get('price_unit', 0)),
-                        'list_price': float(ld.get('list_price', 0)),
-                    })
 
                     po_line_id = int(ld.get('id')) if ld.get('id') else None
                     po_line = self.env['purchase.order.line'].browse(po_line_id) if po_line_id else po.order_line.filtered(
@@ -559,8 +560,10 @@ class PurchaseOrderApi(models.AbstractModel):
                         prod = line.product_id
                         if line.product_uom != prod.uom_po_id and line.product_uom.category_id == prod.uom_po_id.category_id:
                             converted_qty = line.product_uom._compute_quantity(line.product_qty, prod.uom_po_id)
+                            converted_price = line.product_uom._compute_price(line.price_unit, prod.uom_po_id)
                             line.write({
                                 'product_qty': converted_qty,
+                                'price_unit': converted_price,
                                 'product_uom': prod.uom_po_id.id,
                             })
                     try:
@@ -643,8 +646,10 @@ class PurchaseOrderApi(models.AbstractModel):
                 prod = line.product_id
                 if line.product_uom != prod.uom_po_id and line.product_uom.category_id == prod.uom_po_id.category_id:
                     converted_qty = line.product_uom._compute_quantity(line.product_qty, prod.uom_po_id)
+                    converted_price = line.product_uom._compute_price(line.price_unit, prod.uom_po_id)
                     line.write({
                         'product_qty': converted_qty,
+                        'price_unit': converted_price,
                         'product_uom': prod.uom_po_id.id,
                     })
 
@@ -661,12 +666,6 @@ class PurchaseOrderApi(models.AbstractModel):
                     for move in picking.move_ids:
                         if move.location_dest_id == wh.wh_input_stock_loc_id:
                             move.location_dest_id = wh.lot_stock_id.id
-
-            for line in po.order_line:
-                line.product_id.write({
-                    'standard_price': line.price_unit,
-                    'list_price': line.product_id.list_price,
-                })
 
             return {
                 'success': True,
