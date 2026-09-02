@@ -39,6 +39,7 @@ class CustomOrderApi(models.AbstractModel):
         date_to     = kwargs.get('date_to')
         session_id  = kwargs.get('session_id')
         source      = kwargs.get('source')
+        config_name = kwargs.get('config_name')
 
         STATUS_MAP = {
             'draft':     'draft',
@@ -57,6 +58,9 @@ class CustomOrderApi(models.AbstractModel):
 
         if source:
             domain.append(('source', '=', source))
+
+        if config_name and str(config_name).strip() not in ('', 'null', 'undefined'):
+            domain.append(('session_id.config_id.name', 'ilike', str(config_name).strip()))
 
         if date_from:
             domain.append(('date_order', '>=', date_from))
@@ -105,6 +109,7 @@ class CustomOrderApi(models.AbstractModel):
                 'service_fee_type': order.service_fee_type or 'fixed',
                 'note': order.general_note or '',
                 'source': order.source or 'pos',
+                'config_name': order.session_id.config_id.name if order.session_id and order.session_id.config_id else '',
             })
 
         return {
@@ -628,10 +633,10 @@ class CustomOrderApi(models.AbstractModel):
             order.service_fee, order.service_fee_type,
         )
 
-        if order.state != 'draft':
+        if order.state == 'cancelled':
             return {
                 'status': 'error',
-                'message': 'Cannot edit an order that is already paid or completed. Only draft orders can be edited.',
+                'message': 'Cannot edit a cancelled order.',
             }
 
         items = kwargs.get('items', [])
@@ -641,6 +646,7 @@ class CustomOrderApi(models.AbstractModel):
         service_fee_type = str(kwargs.get('service_fee_type', 'fixed') or 'fixed')
         customer_id = kwargs.get('customer_id')
         note = str(kwargs.get('note', '') or '')
+        new_state = kwargs.get('state')
 
         _logger.info(
             "MUTATION UPDATE_ORDER PAYLOAD | order_id=%s | "
@@ -683,7 +689,24 @@ class CustomOrderApi(models.AbstractModel):
             )
             _logger.info("MUTATION UPDATE_ORDER NOTE | order_id=%s | note=%s", order.id, note[:100] if note else '')
 
+            # ---- 2.5. Update state ----
+            VALID_STATES = ['draft', 'paid', 'done', 'cancelled', 'invoiced']
+            if new_state and str(new_state).strip() in VALID_STATES:
+                old_state = order.state
+                self.env.cr.execute(
+                    "UPDATE pos_order SET state = %s WHERE id = %s",
+                    (new_state, order.id),
+                )
+                _logger.info("MUTATION UPDATE_ORDER STATE | order_id=%s | %s -> %s", order.id, old_state, new_state)
+
             # ---- 3. Update lines ----
+            # Record old quantities per product BEFORE changes
+            self.env.cr.execute(
+                "SELECT product_id, SUM(qty) as total_qty FROM pos_order_line WHERE order_id = %s GROUP BY product_id",
+                (order.id,),
+            )
+            old_qty_map = {r[0]: float(r[1]) for r in self.env.cr.fetchall()}
+
             incoming_line_ids = []
             for item in items:
                 line_id = item.get('line_id')
@@ -763,14 +786,14 @@ class CustomOrderApi(models.AbstractModel):
                     self.env.cr.execute("""
                         INSERT INTO pos_order_line
                             (order_id, product_id, name, qty, price_unit, discount,
-                             price_subtotal, price_subtotal_incl, company_id, currency_id,
+                             price_subtotal, price_subtotal_incl, company_id,
                              create_uid, write_uid, create_date, write_date)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                         RETURNING id
                     """, (
                         order.id, product.id, name, qty, price, discount,
                         price_subtotal, price_subtotal_incl,
-                        order.company_id.id, order.currency_id.id,
+                        order.company_id.id,
                         self.env.uid or 1, self.env.uid or 1,
                     ))
                     new_line_id = self.env.cr.fetchone()[0]
@@ -778,6 +801,93 @@ class CustomOrderApi(models.AbstractModel):
                         "MUTATION UPDATE_ORDER CREATE_LINE | order_id=%s | new_line_id=%s | product_id=%s | qty=%s | price=%s",
                         order.id, new_line_id, product_id, qty, price,
                     )
+
+            # ---- 3.5. Adjust stock quantities (direct quant update) ----
+            self.env.cr.execute(
+                "SELECT product_id, SUM(qty) as total_qty FROM pos_order_line WHERE order_id = %s GROUP BY product_id",
+                (order.id,),
+            )
+            new_qty_map = {r[0]: float(r[1]) for r in self.env.cr.fetchall()}
+
+            all_product_ids = set(list(old_qty_map.keys()) + list(new_qty_map.keys()))
+            qty_diffs = {}
+            for pid in all_product_ids:
+                old_q = old_qty_map.get(pid, 0.0)
+                new_q = new_qty_map.get(pid, 0.0)
+                diff = new_q - old_q
+                if abs(diff) > 0.001:
+                    qty_diffs[pid] = diff
+
+            if qty_diffs:
+                _logger.info(
+                    "MUTATION UPDATE_ORDER STOCK_DIFFS | order_id=%s | diffs=%s",
+                    order.id, qty_diffs,
+                )
+
+                # Auto-detect source location with stock
+                product_ids_with_diff = list(qty_diffs.keys())
+                source_location = False
+                if product_ids_with_diff:
+                    StockQuant = self.env['stock.quant']
+                    domain = [
+                        ('product_id', 'in', product_ids_with_diff),
+                        ('location_id.usage', '=', 'internal'),
+                        ('quantity', '>', 0),
+                    ]
+                    quants = StockQuant.search(domain)
+                    if quants:
+                        location_scores = {}
+                        for q in quants:
+                            location_scores[q.location_id.id] = location_scores.get(q.location_id.id, 0) + q.quantity
+                        if location_scores:
+                            best_loc_id = max(location_scores, key=location_scores.get)
+                            source_location = self.env['stock.location'].browse(best_loc_id)
+
+                pos_config = order.session_id.config_id if order.session_id else False
+                if not source_location and pos_config and pos_config.picking_type_id:
+                    source_location = pos_config.picking_type_id.default_location_src_id
+
+                if source_location:
+                    for pid, diff in qty_diffs.items():
+                        product = self.env['product.product'].browse(pid)
+                        if not product.exists():
+                            continue
+                        # diff > 0 means qty increased (selling more) -> deduct from stock
+                        qty_to_adjust = -diff  # negate: selling more = less stock
+                        try:
+                            # Find or create quant for this product at this location
+                            self.env.cr.execute(
+                                "SELECT id, quantity FROM stock_quant WHERE product_id = %s AND location_id = %s LIMIT 1",
+                                (pid, source_location.id),
+                            )
+                            quant_row = self.env.cr.fetchone()
+                            if quant_row:
+                                new_qty = float(quant_row[1]) + qty_to_adjust
+                                self.env.cr.execute(
+                                    "UPDATE stock_quant SET quantity = %s WHERE id = %s",
+                                    (new_qty, quant_row[0]),
+                                )
+                                _logger.info(
+                                    "MUTATION UPDATE_ORDER STOCK_ADJUST | order_id=%s | product_id=%s | qty_adjust=%s | old=%.2f -> new=%.2f | location=%s",
+                                    order.id, pid, qty_to_adjust, float(quant_row[1]), new_qty, source_location.name,
+                                )
+                            else:
+                                # Create new quant
+                                self.env.cr.execute(
+                                    "INSERT INTO stock_quant (product_id, location_id, quantity, company_id, in_date) VALUES (%s, %s, %s, %s, NOW())",
+                                    (pid, source_location.id, qty_to_adjust, order.company_id.id),
+                                )
+                                _logger.info(
+                                    "MUTATION UPDATE_ORDER STOCK_CREATE_QUANT | order_id=%s | product_id=%s | qty=%s | location=%s",
+                                    order.id, pid, qty_to_adjust, source_location.name,
+                                )
+                        except Exception as e:
+                            _logger.warning(
+                                "MUTATION UPDATE_ORDER STOCK_ADJUST_FAILED | order_id=%s | product_id=%s | error=%s",
+                                order.id, pid, str(e),
+                            )
+                else:
+                    _logger.warning("MUTATION UPDATE_ORDER STOCK_SKIP | order_id=%s | No source location found", order.id)
 
             # ---- 4. Update order-level adjustments ----
             self.env.cr.execute("""
@@ -788,6 +898,47 @@ class CustomOrderApi(models.AbstractModel):
                     service_fee_type = %s
                 WHERE id = %s
             """, (order_discount, order_discount_type, service_fee, service_fee_type, order.id))
+
+            # ---- 4.5. Update payments ----
+            incoming_payments = kwargs.get('payments', [])
+            if incoming_payments:
+                # Get existing payment IDs for this order
+                self.env.cr.execute(
+                    "SELECT id FROM pos_payment WHERE pos_order_id = %s",
+                    (order.id,),
+                )
+                existing_pay_ids = [r[0] for r in self.env.cr.fetchall()]
+
+                for pay in incoming_payments:
+                    pay_id = pay.get('id')
+                    method_id = int(pay.get('method_id', 0) or 0)
+                    amount = float(pay.get('amount', 0) or 0)
+
+                    if pay_id and int(pay_id) in existing_pay_ids:
+                        # Update existing payment
+                        self.env.cr.execute(
+                            "UPDATE pos_payment SET amount = %s, payment_method_id = %s WHERE id = %s AND pos_order_id = %s",
+                            (amount, method_id, int(pay_id), order.id),
+                        )
+                        _logger.info("MUTATION UPDATE_ORDER UPDATE_PAYMENT | order_id=%s | pay_id=%s | amount=%s", order.id, pay_id, amount)
+                    elif pay_id is None or pay_id == 0:
+                        # Create new payment
+                        self.env.cr.execute(
+                            "INSERT INTO pos_payment (pos_order_id, payment_method_id, amount, payment_date, company_id, currency_id, create_uid, write_uid, create_date, write_date) VALUES (%s, %s, %s, NOW(), %s, %s, %s, %s, NOW(), NOW()) RETURNING id",
+                            (order.id, method_id, amount, order.company_id.id, order.currency_id.id, self.env.uid or 1, self.env.uid or 1),
+                        )
+                        new_pay_id = self.env.cr.fetchone()[0]
+                        _logger.info("MUTATION UPDATE_ORDER CREATE_PAYMENT | order_id=%s | new_pay_id=%s | amount=%s", order.id, new_pay_id, amount)
+
+                # Delete payments not in the incoming list
+                incoming_pay_ids = [int(p['id']) for p in incoming_payments if p.get('id')]
+                ids_to_delete_pay = [pid for pid in existing_pay_ids if pid not in incoming_pay_ids]
+                if ids_to_delete_pay:
+                    self.env.cr.execute(
+                        "DELETE FROM pos_payment WHERE id IN %s AND pos_order_id = %s",
+                        (tuple(ids_to_delete_pay), order.id),
+                    )
+                    _logger.info("MUTATION UPDATE_ORDER DELETE_PAYMENTS | order_id=%s | deleted_ids=%s", order.id, ids_to_delete_pay)
 
             # ---- 5. Recalculate totals ----
             self.env.invalidate_all()

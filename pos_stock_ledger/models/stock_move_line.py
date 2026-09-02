@@ -53,11 +53,12 @@ class StockMoveLine(models.Model):
 
         if search_query:
             domain.extend([
-                '|', '|', '|',
+                '|', '|', '|', '|',
                 ('product_id.name', 'ilike', search_query),
                 ('product_id.default_code', 'ilike', search_query),
                 ('location_id.complete_name', 'ilike', search_query),
-                ('location_dest_id.complete_name', 'ilike', search_query)
+                ('location_dest_id.complete_name', 'ilike', search_query),
+                ('picking_id.purchase_id.name', 'ilike', search_query),
             ])
 
         all_lines = self.search(domain, order='date desc')
@@ -110,7 +111,8 @@ class StockMoveLine(models.Model):
                 if picking.sale_id:
                     origin = 'طلب بيع (RPC)'
                 elif picking.purchase_id:
-                    origin = 'أمر شراء (PO)'
+                    po_name = picking.purchase_id.name or ''
+                    origin = f'أمر شراء (PO) - {po_name}' if po_name else 'أمر شراء (PO)'
                 elif picking.origin and 'جرد' in picking.origin:
                     origin = 'جرد مخزني'
                 elif picking.origin:
