@@ -46,6 +46,17 @@ class OperationalExpenseApi(models.AbstractModel):
         date_to = params.get('date_to', '')
         state = params.get('state', '')
 
+        if date_from:
+            try:
+                date_from = fields.Date.to_date(date_from)
+            except Exception:
+                pass
+        if date_to:
+            try:
+                date_to = fields.Date.to_date(date_to)
+            except Exception:
+                pass
+
         domain = self._get_company_domain()
         if search_term:
             domain = ['|', ('name', 'ilike', search_term), ('notes', 'ilike', search_term)] + domain

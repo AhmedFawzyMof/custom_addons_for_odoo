@@ -110,6 +110,13 @@ class CustomOrderApi(models.AbstractModel):
                 'note': order.general_note or '',
                 'source': order.source or 'pos',
                 'config_name': order.session_id.config_id.name if order.session_id and order.session_id.config_id else '',
+                'lines': [{
+                    'id': l.id,
+                    'product_id': l.product_id.id,
+                    'qty': l.qty,
+                    'price_unit': l.price_unit,
+                    'standard_price': l.product_id.standard_price if l.product_id else 0.0,
+                } for l in order.lines],
             })
 
         return {
